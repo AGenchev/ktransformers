@@ -255,3 +255,43 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
 
         # Drop original weights after loading
         self.weights_to_keep = None
+
+    def submit_write_weight_scale_to_buffer(
+        self,
+        gpu_tp_count: int,
+        expert_id: int,
+        w13_weight_ptrs,
+        w13_scale_ptrs,
+        w2_weight_ptrs,
+        w2_scale_ptrs,
+    ):
+        """Submit the write_weight_scale_to_buffer task for the LLAMAFILE backend.
+
+        The C++ operator dequantizes this TP's local slice of the expert to
+        bf16 and writes it into the GPU-side staging buffers consumed by the
+        sglang full-GPU prefill pipeline (ktransformers issues #2108/#2113).
+        The pointer lists should be plain integer lists (e.g. tensor.data_ptr()).
+        """
+        if self.moe is None:
+            raise RuntimeError("MoE instance not initialized; cannot submit write_weight_scale_to_buffer task.")
+
+        if not hasattr(self.moe, "write_weight_scale_to_buffer_task"):
+            raise NotImplementedError(
+                "write_weight_scale_to_buffer_task is not available for this backend implementation."
+            )
+
+        self.cpu_infer.submit(
+            self.moe.write_weight_scale_to_buffer_task(
+                gpu_tp_count,
+                expert_id,
+                w13_weight_ptrs,
+                w13_scale_ptrs,
+                w2_weight_ptrs,
+                w2_scale_ptrs,
+            )
+        )
+
+    def sync_write_weight_scale_to_buffer(self):
+        """Block until previously submitted write_weight_scale_to_buffer tasks finish."""
+        # The CPUInfer.sync() call blocks until pending tasks complete.
+        self.cpu_infer.sync()

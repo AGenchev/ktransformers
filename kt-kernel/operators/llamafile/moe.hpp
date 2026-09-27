@@ -401,6 +401,121 @@ class LLAMA_MOE_TP {
     }
   }
 
+  // Dequantize this TP's local slice of one expert to bf16 into the GPU-side
+  // staging buffers used by the sglang full-GPU prefill pipeline (issues
+  // #2108/#2113). The staging buffers are pinned host memory written by CPU
+  // and DMA'd by the caller, so plain stores suffice.
+  //
+  // Layout contract (must match sglang kt_ep_wrapper._prepare_weight_bf16):
+  //   w13_weight: [2 * gpu_inter_local, hidden] bf16, gate rows first, up second
+  //   w2_weight:  [hidden, gpu_inter_local] bf16
+  // where gpu_inter_local = full_config.intermediate_size / gpu_tp_count.
+  //
+  // TP mapping mirrors load_weights(): the outer TP_MOE accumulates
+  // per-TP intermediate offsets from tp_configs (uneven splits supported)
+  // and passes this TP's offset in as inter_offset. Global intermediate row
+  // r = inter_offset + local_row lands in GPU slot r / gpu_inter_local at
+  // row r % gpu_inter_local, where gpu_inter_local =
+  // full_config.intermediate_size / gpu_tp_count (sglang splits GPU
+  // weights evenly across TP ranks).
+  void write_weights_to_buffer(int gpu_tp_count, [[maybe_unused]] int cpu_tp_count, int expert_id, int inter_offset,
+                               const GeneralMOEConfig& full_config, const std::vector<uintptr_t>& w13_weight_ptrs,
+                               [[maybe_unused]] const std::vector<uintptr_t>& w13_scale_ptrs,
+                               const std::vector<uintptr_t>& w2_weight_ptrs,
+                               [[maybe_unused]] const std::vector<uintptr_t>& w2_scale_ptrs) const {
+    auto& config = config_;
+    const int local_inter = config.intermediate_size;
+    const int gpu_inter_local = full_config.intermediate_size / gpu_tp_count;
+    if (expert_id < 0 || expert_id >= config.expert_num) {
+      throw std::runtime_error("LLAMAFILE write_weights_to_buffer: expert_id out of range");
+    }
+
+    const size_t gate_expert_stride = (size_t)local_inter * config.hidden_size *
+                                      ggml_type_size((ggml_type)config.gate_type) /
+                                      ggml_blck_size((ggml_type)config.gate_type);
+    const size_t up_expert_stride = (size_t)local_inter * config.hidden_size *
+                                    ggml_type_size((ggml_type)config.up_type) /
+                                    ggml_blck_size((ggml_type)config.up_type);
+    const size_t down_expert_stride = (size_t)config.hidden_size * local_inter *
+                                      ggml_type_size((ggml_type)config.down_type) /
+                                      ggml_blck_size((ggml_type)config.down_type);
+
+    const uint8_t* gate_src = m_local_gate_proj_ + (size_t)expert_id * gate_expert_stride;
+    const uint8_t* up_src = m_local_up_proj_ + (size_t)expert_id * up_expert_stride;
+    const uint8_t* down_src = m_local_down_proj_ + (size_t)expert_id * down_expert_stride;
+
+    auto pool = config.pool->get_subpool(tp_part_idx);
+
+    // Rows of gate/up are independent: dequantize + convert each intermediate
+    // row of the [local_inter, hidden] matrix. Down is [hidden, local_inter]
+    // (transposed storage), so dequantize per hidden row.
+    constexpr int MIN_ROWS_PER_TASK = 16;
+    int num_w13_tasks = std::min(std::max(1, local_inter / MIN_ROWS_PER_TASK), 32);
+    int num_w2_tasks = std::min(std::max(1, config.hidden_size / MIN_ROWS_PER_TASK), 32);
+
+    pool->do_work_stealing_job(
+        num_w13_tasks * 2 + num_w2_tasks, nullptr,
+        [=, this](int task_id) {
+          const size_t gate_row_bytes = (size_t)config.hidden_size * ggml_type_size((ggml_type)config.gate_type) /
+                                        ggml_blck_size((ggml_type)config.gate_type);
+          const size_t up_row_bytes = (size_t)config.hidden_size * ggml_type_size((ggml_type)config.up_type) /
+                                      ggml_blck_size((ggml_type)config.up_type);
+          if (task_id < num_w13_tasks) {
+            // gate chunk: local rows [r0, r1) of the [local_inter, hidden] matrix
+            const int rows_per_task = (local_inter + num_w13_tasks - 1) / num_w13_tasks;
+            const int r0 = task_id * rows_per_task;
+            const int r1 = std::min(r0 + rows_per_task, local_inter);
+            std::vector<float> row(config.hidden_size);
+            for (int r = r0; r < r1; r++) {
+              const int global_n = inter_offset + r;
+              const int target_gpu = global_n / gpu_inter_local;
+              const int n_in_gpu = global_n % gpu_inter_local;
+              ggml_bf16_t* dst = (ggml_bf16_t*)w13_weight_ptrs[target_gpu];
+              to_float(gate_src + (size_t)r * gate_row_bytes, row.data(), config.hidden_size,
+                       (ggml_type)config.gate_type);
+              ggml_fp32_to_bf16_row(row.data(), dst + (size_t)n_in_gpu * config.hidden_size, config.hidden_size);
+            }
+          } else if (task_id < num_w13_tasks * 2) {
+            // up chunk: gpu-side up block sits after the gate rows
+            const int rows_per_task = (local_inter + num_w13_tasks - 1) / num_w13_tasks;
+            const int idx = task_id - num_w13_tasks;
+            const int r0 = idx * rows_per_task;
+            const int r1 = std::min(r0 + rows_per_task, local_inter);
+            std::vector<float> row(config.hidden_size);
+            for (int r = r0; r < r1; r++) {
+              const int global_n = inter_offset + r;
+              const int target_gpu = global_n / gpu_inter_local;
+              const int n_in_gpu = global_n % gpu_inter_local;
+              ggml_bf16_t* dst = (ggml_bf16_t*)w13_weight_ptrs[target_gpu] +
+                                 (size_t)gpu_inter_local * config.hidden_size;
+              to_float(up_src + (size_t)r * up_row_bytes, row.data(), config.hidden_size, (ggml_type)config.up_type);
+              ggml_fp32_to_bf16_row(row.data(), dst + (size_t)n_in_gpu * config.hidden_size, config.hidden_size);
+            }
+          } else {
+            // down chunk: rows [h0, h1) of the [hidden, local_inter] matrix;
+            // the intermediate (K) axis is what maps across GPU slots
+            const int idx = task_id - num_w13_tasks * 2;
+            const int rows_per_task = (config.hidden_size + num_w2_tasks - 1) / num_w2_tasks;
+            const int h0 = idx * rows_per_task;
+            const int h1 = std::min(h0 + rows_per_task, config.hidden_size);
+            const size_t down_row_bytes = (size_t)local_inter * ggml_type_size((ggml_type)config.down_type) /
+                                          ggml_blck_size((ggml_type)config.down_type);
+            std::vector<float> row(local_inter);
+            for (int h = h0; h < h1; h++) {
+              to_float(down_src + (size_t)h * down_row_bytes, row.data(), local_inter, (ggml_type)config.down_type);
+              for (int k = 0; k < local_inter; k++) {
+                const int global_k = inter_offset + k;
+                const int target_gpu = global_k / gpu_inter_local;
+                const int k_in_gpu = global_k % gpu_inter_local;
+                ggml_bf16_t* dst = (ggml_bf16_t*)w2_weight_ptrs[target_gpu];
+                dst[(size_t)h * gpu_inter_local + k_in_gpu] = ggml_fp32_to_bf16(row[k]);
+              }
+            }
+          }
+        },
+        nullptr);
+  }
+
   static float act_fn(float gate, float up, float swiglu_limit) {
     if (swiglu_limit > 0.0f) {
       gate = fminf(gate, swiglu_limit);
@@ -949,6 +1064,37 @@ class TP_MOE<LLAMA_MOE_TP> : public TP_MOE_Common<LLAMA_MOE_TP> {
       this->tps[tp_id]->load_weights(this->config.intermediate_size, tp_offsets[tp_id]);
     });
     this->weights_loaded = true;
+  }
+
+  // Write one expert's weights into the GPU-side staging buffers for all TP
+  // parts (sglang full-GPU prefill pipeline, issues #2108/#2113). SFINAE in
+  // ext_bindings.cpp detects this method and auto-binds
+  // write_weight_scale_to_buffer_task.
+  void write_weight_scale_to_buffer(int gpu_tp_count, int expert_id, const std::vector<uintptr_t>& w13_weight_ptrs,
+                                    const std::vector<uintptr_t>& w13_scale_ptrs, const std::vector<uintptr_t>& w2_weight_ptrs,
+                                    const std::vector<uintptr_t>& w2_scale_ptrs) {
+    if (this->weights_loaded == false) {
+      throw std::runtime_error("Not Loaded");
+    }
+    if (this->tps.empty()) {
+      throw std::runtime_error("No TP parts initialized");
+    }
+    if ((int)w13_weight_ptrs.size() != gpu_tp_count || (int)w2_weight_ptrs.size() != gpu_tp_count) {
+      throw std::runtime_error("Weight pointer arrays size must match gpu_tp_count");
+    }
+
+    // Per-TP intermediate offsets, mirroring TP_MOE<LLAMA_MOE_TP>::load_weights()
+    std::vector<int> tp_offsets(this->tp_count);
+    int accumulated_offset = 0;
+    for (int i = 0; i < this->tp_count; i++) {
+      tp_offsets[i] = accumulated_offset;
+      accumulated_offset += this->tp_configs[i].intermediate_size;
+    }
+
+    this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
+      this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, tp_offsets[i], this->config,
+                                            w13_weight_ptrs, w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
+    });
   }
 
   void merge_results(int qlen, void* output) { merge_results(qlen, output, false); }
