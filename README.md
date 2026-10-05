@@ -106,6 +106,37 @@ In `python/sglang/srt/layers/moe/kt_ep_wrapper.py`:
 > dataclass field `max_deferred_experts_per_token`). Apply changes to that
 > file via a script in `dev/patches/` executed from the host shell.
 
+### Change 3 — kt-kernel: optional pre-dequantized BF16 expert pool (fast source)
+
+Commit `2d6ecdf` (on the same branch, pushed to fork `main` and
+`fix/issue-2108-llamafile-write-weights`). An optional mmap-backed pool
+replaces per-layer GGUF dequantization as the row source of
+`write_weights_to_buffer`:
+
+- Set `KT_BF16_EXPERT_POOL=/work/models/GLM-5.3-bf16-expert-pool` (layout:
+  `pool.bin` + `pool.json`, produced by `dev_extract_bf16_expert_pool.py`
+  from the original GLM-5.3 BF16 safetensors: append-ordered by
+  (moe layer, expert) of gate|up|down in bf16 row-major).
+- Validated lazy open (`std::call_once`, race-free across NUMA worker
+  threads); on any mismatch (dims, layer not covered, missing file) it
+  prints one warning and falls back silently to the GGUF dequant path.
+- TP slot mapping from e1cde21 is reused verbatim: gate/up bases shift by
+  `inter_offset` rows; down shifts along its K axis within
+  `[hidden, full_inter]` rows.
+- Fidelity: pool bytes are bit-exact vs the BF16 checkpoint (24 sampled
+  layer/expert/role tensors byte-identical), so prefill quality improves
+  over dequantized Q5_K_XL. A "BF16 GGUF" would be bit-identical to this
+  pool and adds nothing.
+- Functional test `kt-kernel/test_bf16_pool_llamafile.py`: synthetic pool
+  must win over GGUF dequant for gpu_tp_count 1 and 2; bad-path fallback
+  keeps dequant behavior. The dequant path is unchanged
+  (`test_write_buffer_llamafile.py` still passes).
+- E2E (GLM-5.3, 4×A100 TP4, chunk 12288, 256 experts × 76 layers,
+  1.4 TB pool): first pass is NVMe-bound (~7.8 s/layer, streaming the pool
+  from disk); warm page-cache passes drop to ~0.48 s/layer and 37–44 s wall
+  for a ~9k-token prefill vs 52.7 s for the GGUF-dequant baseline at steady
+  state (~2.2 TB RAM host keeps the whole pool cacheable).
+
 ### Result (verified end-to-end, 2026-10-02)
 
 GLM-5.3, LLAMAFILE method, Q5_K_XL CPU experts, 4×A100 TP4,
