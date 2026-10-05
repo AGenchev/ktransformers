@@ -5,10 +5,14 @@
 #endif
 #include <numa.h>
 #include <numaif.h>
+#include <fcntl.h>     // open (BF16 expert pool mmap)
 #include <sys/mman.h>  // madvise / MADV_WILLNEED (warm the aliased GGUF mmap into page cache)
+#include <sys/stat.h>  // fstat (BF16 expert pool size check)
 #include <unistd.h>    // sysconf(_SC_PAGESIZE)
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -67,6 +71,218 @@ inline void debug_quant(void* input, ggml_type type) {
     printf("%f ", output[i]);
   }
   printf("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Optional pre-dequantized BF16 expert pool (full-GPU prefill fast source).
+//
+// Set KT_BF16_EXPERT_POOL to a directory containing pool.bin + pool.json
+// (produced by dev_extract_bf16_expert_pool.py: concatenation over
+// (moe_layer L, expert E) of [gate (inter,hidden) | up (inter,hidden) |
+// down (hidden,inter)] in BF16, row-major, append-ordered by layer).
+//
+// When set AND the pool matches the model (hidden/inter/expert counts,
+// layer present in moe_layer_ids), write_weights_to_buffer memcpy's bf16
+// rows from the mmap instead of dequantizing the quantized GGUF — removing
+// the per-layer dequant cost from the sglang full-GPU prefill weight prep
+// and improving fidelity (pool bytes come from the original BF16 checkpoint).
+// Mismatches print one warning and permanently disable the pool (fallback to
+// GGUF dequantization, i.e. the pre-pool behavior).
+// ---------------------------------------------------------------------------
+struct KtBf16PoolExpertPtrs {
+  const uint8_t* gate = nullptr;
+  const uint8_t* up = nullptr;
+  const uint8_t* down = nullptr;
+  explicit operator bool() const { return gate != nullptr; }
+};
+
+inline bool kt_json_find_int(const std::string& s, const char* key, int64_t& out) {
+  const std::string pat = "\"" + std::string(key) + "\"";
+  size_t p = s.find(pat);
+  if (p == std::string::npos) return false;
+  p = s.find(':', p + pat.size());
+  if (p == std::string::npos) return false;
+  out = std::strtoll(s.c_str() + p + 1, nullptr, 10);
+  return true;
+}
+
+inline bool kt_json_find_int_array(const std::string& s, const char* key, std::vector<int64_t>& out) {
+  const std::string pat = "\"" + std::string(key) + "\"";
+  size_t p = s.find(pat);
+  if (p == std::string::npos) return false;
+  p = s.find('[', p + pat.size());
+  if (p == std::string::npos) return false;
+  size_t q = s.find(']', p);
+  if (q == std::string::npos) return false;
+  out.clear();
+  size_t i = p + 1;
+  while (i < q) {
+    char* end = nullptr;
+    long long v = std::strtoll(s.c_str() + i, &end, 10);
+    if (end == s.c_str() + i) {
+      i++;
+      continue;
+    }
+    out.push_back((int64_t)v);
+    i = (size_t)(end - s.c_str());
+  }
+  return true;
+}
+
+struct KtBf16PoolState {
+  std::atomic<bool> enabled{false};
+  int fd = -1;
+  void* map_base = nullptr;
+  size_t map_bytes = 0;
+  int64_t n_experts = 0, inter = 0, hidden = 0;
+  size_t per_expert_bytes = 0;
+  std::vector<int64_t> moe_layer_ids;
+
+  void disable(const char* reason) {
+    fprintf(stderr, "[KtBf16Pool] disabled: %s (falling back to GGUF dequantization)\n", reason);
+    fflush(stderr);
+    enabled.store(false, std::memory_order_release);
+  }
+
+  // Resolve the [gate|up|down] bf16 section pointers for one (layer, expert).
+  // Returns all-null on any failure (with at most one warning per failure kind).
+  // NOTE: called concurrently from all NUMA TP threads of a write task; lazy
+  // open must go through kt_bf16_pool_resolve's std::call_once (below), and
+  // after open succeeds the metadata fields are immutable.
+  KtBf16PoolExpertPtrs resolve(int layer_idx, int64_t want_hidden, int64_t want_inter, int64_t want_experts,
+                               int expert_id) {
+    if (!enabled.load(std::memory_order_acquire)) return {};
+    if (want_hidden != hidden || want_experts != n_experts) {
+      disable("model dims do not match pool.json (hidden/n_experts)");
+      return {};
+    }
+    if (want_inter != inter) {
+      disable("full intermediate_size does not match pool.json");
+      return {};
+    }
+    if (expert_id < 0 || expert_id >= n_experts) {
+      disable("expert_id out of pool range");
+      return {};
+    }
+    int64_t ordinal = -1;
+    for (size_t i = 0; i < moe_layer_ids.size(); i++) {
+      if (moe_layer_ids[i] == layer_idx) {
+        ordinal = (int64_t)i;
+        break;
+      }
+    }
+    if (ordinal < 0) {
+      // Dense layer or layer not covered by the pool: dequant path, no warning.
+      return {};
+    }
+    const size_t layer_base = (size_t)ordinal * n_experts * per_expert_bytes;
+    const size_t expert_base = layer_base + (size_t)expert_id * per_expert_bytes;
+    const size_t section = (size_t)inter * hidden * 2;  // gate and up sections per expert
+    KtBf16PoolExpertPtrs p;
+    p.gate = (const uint8_t*)map_base + expert_base;
+    p.up = p.gate + section;
+    p.down = p.gate + 2 * section;
+    return p;
+  }
+
+  bool open_pool(const char* dir) {
+    const std::string json_path = std::string(dir) + "/pool.json";
+    FILE* jf = fopen(json_path.c_str(), "rb");
+    if (!jf) {
+      disable("cannot open pool.json");
+      return false;
+    }
+    std::string json;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), jf)) > 0) json.append(buf, n);
+    fclose(jf);
+
+    int64_t dtype_ok = 0;
+    if (json.find("\"BF16\"") == std::string::npos) {
+      disable("pool.json dtype is not BF16");
+      return false;
+    }
+    (void)dtype_ok;
+    std::vector<int64_t> layers;
+    int64_t experts = 0, inter_v = 0, hidden_v = 0, per_expert = 0, total = 0;
+    if (!kt_json_find_int_array(json, "moe_layer_ids", layers) || !kt_json_find_int(json, "n_experts", experts) ||
+        !kt_json_find_int(json, "inter", inter_v) || !kt_json_find_int(json, "hidden", hidden_v) ||
+        !kt_json_find_int(json, "per_expert_bytes", per_expert) || !kt_json_find_int(json, "total_bytes", total)) {
+      disable("pool.json is missing required fields");
+      return false;
+    }
+    if (layers.empty() || experts <= 0 || inter_v <= 0 || hidden_v <= 0 || per_expert <= 0) {
+      disable("pool.json has invalid values");
+      return false;
+    }
+    const size_t expect_per_expert = (size_t)(2 * inter_v * hidden_v + hidden_v * inter_v) * 2;
+    if ((size_t)per_expert != expect_per_expert) {
+      disable("per_expert_bytes inconsistent with dims");
+      return false;
+    }
+
+    const std::string bin_path = std::string(dir) + "/pool.bin";
+    fd = ::open(bin_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+      disable("cannot open pool.bin");
+      return false;
+    }
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || (size_t)st.st_size < (size_t)total) {
+      disable("pool.bin smaller than total_bytes");
+      ::close(fd);
+      fd = -1;
+      return false;
+    }
+    void* m = ::mmap(nullptr, (size_t)total, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (m == MAP_FAILED) {
+      disable("mmap of pool.bin failed");
+      ::close(fd);
+      fd = -1;
+      return false;
+    }
+    ::madvise(m, (size_t)total, MADV_WILLNEED);
+    map_base = m;
+    map_bytes = (size_t)total;
+    n_experts = experts;
+    inter = inter_v;
+    hidden = hidden_v;
+    per_expert_bytes = (size_t)per_expert;
+    moe_layer_ids = std::move(layers);
+    printf("[KtBf16Pool] enabled: %s (%d layers x %lld experts, inter=%lld hidden=%lld, %.1f GiB mmap)\n", dir,
+           (int)moe_layer_ids.size(), (long long)n_experts, (long long)inter, (long long)hidden,
+           map_bytes / (1024.0 * 1024.0 * 1024.0));
+    fflush(stdout);
+    return true;
+  }
+};
+
+// Process-wide singleton: opened at most once (std::call_once), even when the
+// first write task's NUMA threads all hit resolve concurrently. Eager warm-up
+// is done from LLAMA_MOE_TP::load_weights via kt_bf16_pool_warm(); resolve()
+// defensively calls it too, so lazy open remains correct if warm was missed.
+inline KtBf16PoolState& kt_bf16_pool_state() {
+  static KtBf16PoolState state;
+  return state;
+}
+
+inline void kt_bf16_pool_warm() {
+  auto& state = kt_bf16_pool_state();
+  static std::once_flag once;
+  std::call_once(once, [] {
+    const char* dir = std::getenv("KT_BF16_EXPERT_POOL");
+    if (dir && dir[0]) {
+      kt_bf16_pool_state().enabled.store(kt_bf16_pool_state().open_pool(dir), std::memory_order_release);
+    }
+  });
+  (void)state;
+}
+
+inline KtBf16PoolExpertPtrs kt_bf16_pool_resolve(int layer_idx, int64_t hidden, int64_t inter_full, int64_t expert_num,
+                                                 int expert_id) {
+  kt_bf16_pool_warm();
+  return kt_bf16_pool_state().resolve(layer_idx, hidden, inter_full, expert_num, expert_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +484,9 @@ class LLAMA_MOE_TP {
 
   void load_weights(int complete_intermediate_size, int offset) {
     auto& config = config_;
+    // Open the BF16 expert pool (if configured) before any write task fans out;
+    // cheap no-op after the first layer.
+    kt_bf16_pool_warm();
     // printf("gate load weights:");
     // debug_quant(config.gate_proj, (ggml_type)config.gate_type);
     // we need to make sure the blck size is correct for size.
@@ -444,7 +663,6 @@ class LLAMA_MOE_TP {
     const uint8_t* up_src = m_local_up_proj_ + (size_t)expert_id * up_expert_stride;
     const uint8_t* down_src = m_local_down_proj_ + (size_t)expert_id * down_expert_stride;
 
-    auto pool = config.pool->get_subpool(tp_part_idx);
 
     // Rows of gate/up are independent: dequantize + convert each intermediate
     // row of the [local_inter, hidden] matrix. Down is [hidden, local_inter]
@@ -452,6 +670,90 @@ class LLAMA_MOE_TP {
     constexpr int MIN_ROWS_PER_TASK = 16;
     int num_w13_tasks = std::min(std::max(1, local_inter / MIN_ROWS_PER_TASK), 32);
     int num_w2_tasks = std::min(std::max(1, config.hidden_size / MIN_ROWS_PER_TASK), 32);
+
+    // Optional fast source: pre-dequantized BF16 pool (KT_BF16_EXPERT_POOL).
+    // Same TP slot mapping and layout contract as the dequant path below;
+    // only the row source changes (memcpy bf16 vs dequantize+convert).
+    auto pool = config.pool->get_subpool(tp_part_idx);
+    KtBf16PoolExpertPtrs pool_src = kt_bf16_pool_resolve(full_config.layer_idx, config.hidden_size,
+                                                         full_config.intermediate_size, config.expert_num, expert_id);
+    if (pool_src) {
+      const size_t gate_row_bytes = (size_t)config.hidden_size * 2;  // bf16 row-major in pool
+      // Pool sections are sized by the FULL intermediate size, not this TP's
+      // local slice: each expert in pool.bin = [gate (full_inter,hidden) |
+      // up (full_inter,hidden) | down (hidden,full_inter)] bf16.
+      const size_t full_inter = (size_t)full_config.intermediate_size;
+      const size_t section = full_inter * (size_t)config.hidden_size * 2;
+      // This TP owns global intermediate rows [inter_offset, inter_offset + local_inter)
+      // of the full matrices, so its pool reads start at that row offset.
+      const uint8_t* gate_rows = pool_src.gate + (size_t)inter_offset * gate_row_bytes;
+      const uint8_t* up_rows = pool_src.up + (size_t)inter_offset * gate_row_bytes;
+      const size_t pool_down_row_bytes = full_inter * 2;
+      // NOTE: for down, inter_offset shifts along the K axis WITHIN each row
+      // (pool down is [hidden, full_inter]); the row axis is hidden, shared
+      // by all TPs. gate/up differ: their row axis IS the intermediate axis,
+      // so their base pointers shift by inter_offset rows (done above).
+      pool->do_work_stealing_job(
+          num_w13_tasks * 2 + num_w2_tasks, nullptr,
+          [=](int task_id) {
+            if (task_id < num_w13_tasks) {
+              const int rows_per_task = (local_inter + num_w13_tasks - 1) / num_w13_tasks;
+              const int r0 = task_id * rows_per_task;
+              const int r1 = std::min(r0 + rows_per_task, local_inter);
+              for (int r = r0; r < r1; r++) {
+                const int global_n = inter_offset + r;
+                const int target_gpu = global_n / gpu_inter_local;
+                const int n_in_gpu = global_n % gpu_inter_local;
+                ggml_bf16_t* dst = (ggml_bf16_t*)w13_weight_ptrs[target_gpu];
+                memcpy(dst + (size_t)n_in_gpu * config.hidden_size, gate_rows + (size_t)r * gate_row_bytes,
+                       gate_row_bytes);
+              }
+            } else if (task_id < num_w13_tasks * 2) {
+              const int rows_per_task = (local_inter + num_w13_tasks - 1) / num_w13_tasks;
+              const int idx = task_id - num_w13_tasks;
+              const int r0 = idx * rows_per_task;
+              const int r1 = std::min(r0 + rows_per_task, local_inter);
+              for (int r = r0; r < r1; r++) {
+                const int global_n = inter_offset + r;
+                const int target_gpu = global_n / gpu_inter_local;
+                const int n_in_gpu = global_n % gpu_inter_local;
+                ggml_bf16_t* dst = (ggml_bf16_t*)w13_weight_ptrs[target_gpu] +
+                                   (size_t)gpu_inter_local * config.hidden_size;
+                memcpy(dst + (size_t)n_in_gpu * config.hidden_size, up_rows + (size_t)r * gate_row_bytes,
+                       gate_row_bytes);
+              }
+            } else {
+              const int idx = task_id - num_w13_tasks * 2;
+              const int rows_per_task = (config.hidden_size + num_w2_tasks - 1) / num_w2_tasks;
+              const int h0 = idx * rows_per_task;
+              const int h1 = std::min(h0 + rows_per_task, config.hidden_size);
+              // Down is [hidden, local_inter] row-major in the pool (row = one
+              // hidden position, length local_inter bf16). The intermediate (K)
+              // axis maps across GPU slots: the CPU TP's contiguous K-range
+              // [inter_offset, inter_offset+local_inter) is split into runs per
+              // intersecting GPU slot and memcpy'd into each slot's row segment.
+              const size_t pool_row_bytes = pool_down_row_bytes;
+              for (int h = h0; h < h1; h++) {
+                const int k_start = inter_offset;
+                const int k_end = inter_offset + local_inter;
+                for (int g = k_start / gpu_inter_local;
+                     g < gpu_tp_count && (size_t)g * gpu_inter_local < (size_t)k_end; g++) {
+                  const int ks = std::max(k_start, g * gpu_inter_local);
+                  const int ke = std::min(k_end, (g + 1) * gpu_inter_local);
+                  if (ks >= ke) continue;
+                  const size_t src_off = (size_t)(ks - k_start);
+                  const size_t dst_off = (size_t)(ks - g * gpu_inter_local);
+                  ggml_bf16_t* dst = (ggml_bf16_t*)w2_weight_ptrs[g];
+                  memcpy((uint8_t*)(dst + (size_t)h * gpu_inter_local + dst_off),
+                         pool_src.down + (size_t)h * pool_row_bytes + (size_t)inter_offset * 2 + src_off * 2,
+                         (size_t)(ke - ks) * 2);
+                }
+              }
+            }
+          },
+          nullptr);
+      return;  // pool source handled this expert
+    }
 
     pool->do_work_stealing_job(
         num_w13_tasks * 2 + num_w2_tasks, nullptr,
