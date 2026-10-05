@@ -1,174 +1,168 @@
-<div align="center">
-  <p align="center">
+# K-transformers — Local Development Workspace
 
-<picture>
-    <img alt="KTransformers" src="https://github.com/user-attachments/assets/d5a2492f-a415-4456-af99-4ab102f13f8b" width=50%>
+This is the working directory for local development on
+[KTransformers](https://github.com/kvcache-ai/KTransformers). It contains an
+upstream clone, local patches, and a containerized build/dev environment.
 
-</picture>
-
-</p>
-  <h3>A Flexible Framework for Experiencing Cutting-edge LLM Inference/Fine-tune Optimizations</h3>
-  <strong><a href="#-overview">🎯 Overview</a> | <a href="#-inference---high-performance-kt-kernel-serving">🚀 Inference</a> | <a href="#-sft---fine-tuning-with-llama-factory">🎓 SFT</a> | <a href="#-citation">🔥 Citation</a> | <a href="https://github.com/kvcache-ai/ktransformers/issues/1921">🚀 Roadmap(2026Q2)</a>  </strong>
-</div>
-
-## 🎯 Overview
-
-KTransformers is a research project focused on efficient inference and fine-tuning of large language models through CPU-GPU heterogeneous computing. The project now exposes two user-facing capabilities from the kt-kernel source tree: [Inference](./kt-kernel/README.md) and [SFT](./doc/en/SFT/KTransformers-Fine-Tuning_Cookbook.md).
-
-## 🔥 Updates
-* **Sep 13, 2026**: **Kimi K2.5 / K2.6 LoRA fine-tuning** is supported with native RAWINT4 routed experts.
-* **Aug 26, 2026**: Added native support for **GLM-5.3-flash**, bringing 1M-token context and multimodal input to consumer GPUs. ([Tutorial](./doc/en/kt-kernel/GLM-5.3-Flash-Tutorial.md))
-* **Aug 25, 2026**: Uploaded a new easy-to-use [KTransformers × LlamaFactory MoE Fine-Tuning Cookbook](./doc/en/SFT/KTransformers-Fine-Tuning_Cookbook.md), covering hardware checks, installation, BF16/FP8/INT8 recipes, LoRA and full fine-tuning, resource planning, and troubleshooting.
-* **Aug 17, 2026**: LoRA fine-tuning now supports compatible AVX512 x86 CPUs, including AMD servers, without requiring AMX. ([v0.7.0 Release Notes](https://github.com/kvcache-ai/ktransformers/releases/tag/v0.7.0))
-* **Aug 16, 2026**: DeepSeek-V4-Flash on a single Ascend NPU with CPU expert offload. ([Tutorial](./doc/en/DeepSeek-V4-Flash_tutorial_for_Ascend_NPU.md))
-* **Aug 5, 2026**: Introduced native block-FP8 LoRA fine-tuning ([PR #2141](https://github.com/kvcache-ai/ktransformers/pull/2141))
-* **July 23, 2026**: Added end-to-end BF16 full-parameter fine-tuning for MoE models, including complete checkpoint saving. ([PR #2094](https://github.com/kvcache-ai/ktransformers/pull/2094))
-* **June 21, 2026**: MiniMax-M3 Day0 Support! ([Tutorial](./doc/en/kt-kernel/MiniMax-M3-Tutorial.md))
-* **June 17, 2026**: GLM-5.2 Day0 Support! ([Tutorial](./doc/en/kt-kernel/GLM-5.2-Tutorial.md))
-* **May 6, 2026**: KTransformers at [GOSIM Paris 2026](https://paris2026.gosim.org/zh/schedule/) — "Agentic AI on Edge" track. We'll present KT's inference performance on consumer hardware.
-* **May 02, 2026**: DeepSeek-V4-Flash Support! ([Tutorial](./doc/en/DeepSeek-V4-Flash.md))
-* **Apr 30, 2026**: KTransformers v0.6.1 refreshes kt-kernel inference and SFT docs with separate [Inference](./kt-kernel/README.md) and [SFT Quick Start](./doc/en/SFT/KTransformers-Fine-Tuning_Quick-Start.md) entry points.
-* **Mar 26, 2026**: Support AVX2-only CPU backend for KT-Kernel inference. ([Tutorial](./doc/en/kt-kernel/AVX2-Tutorial.md))
-* **Feb 13, 2026**: MiniMax-M2.5 Day0 Support! ([Tutorial](./doc/en/MiniMax-M2.5.md))
-* **Feb 12, 2026**: GLM-5 Day0 Support! ([Tutorial](./doc/en/kt-kernel/GLM-5-Tutorial.md))
-* **Jan 27, 2026**: Kimi-K2.5 Day0 Support! ([Tutorial](./doc/en/Kimi-K2.5.md)) ([SFT Tutorial](./doc/en/SFT_Installation_Guide_KimiK2.5.md))
-* **Jan 22, 2026**: Support [CPU-GPU Expert Scheduling](./doc/en/kt-kernel/experts-sched-Tutorial.md), [Native BF16 and FP8 per channel Precision](./doc/en/kt-kernel/Native-Precision-Tutorial.md) and [AutoDL unified fine-tuning and inference](./doc/zh/【云端低价训推】%20KTransformers%2BAutoDL%2BLlamaFactory：随用随租的低成本超大模型「微调%2B推理」一体化流程.pdf)
-* **Dec 24, 2025**: Support Native MiniMax-M2.1 inference. ([Tutorial](./doc/en/kt-kernel/MiniMax-M2.1-Tutorial.md))
-* **Dec 22, 2025**: Support RL-DPO fine-tuning with LLaMA-Factory. ([Tutorial](./doc/en/SFT/DPO_tutorial.md))
-* **Dec 5, 2025**: Support Native Kimi-K2-Thinking inference ([Tutorial](./doc/en/kt-kernel/Kimi-K2-Thinking-Native.md))
-* **Nov 6, 2025**: Support Kimi-K2-Thinking inference ([Tutorial](./doc/en/Kimi-K2-Thinking.md)) and fine-tune ([Tutorial](./doc/en/SFT_Installation_Guide_KimiK2.md))
-* **Nov 4, 2025**: KTransformers Fine-Tuning × LLaMA-Factory Integration. ([Tutorial](./doc/en/SFT/KTransformers-Fine-Tuning_User-Guide.md))
-* **Oct 27, 2025**: Support Ascend NPU. ([Tutorial](./doc/zh/DeepseekR1_V3_tutorial_zh_for_Ascend_NPU.md))
-* **Oct 10, 2025**: Integrating into SGLang. ([Roadmap](https://github.com/sgl-project/sglang/issues/11425), [Blog](https://lmsys.org/blog/2025-10-22-KTransformers/))
-* **Sept 11, 2025**: Support Qwen3-Next. ([Tutorial](./doc/en/Qwen3-Next.md))
-* **Sept 05, 2025**: Support Kimi-K2-0905. ([Tutorial](./doc/en/Kimi-K2.md))
-* **July 26, 2025**: Support SmallThinker and GLM4-MoE. ([Tutorial](./doc/en/SmallThinker_and_Glm4moe.md))
-* **July 11, 2025**: Support Kimi-K2. ([Tutorial](./doc/en/Kimi-K2.md))
-* **June 30, 2025**: Support 3-layer (GPU-CPU-Disk) [prefix cache](./doc/en/prefix_cache.md) reuse.
-* **May 14, 2025**: Support Intel Arc GPU ([Tutorial](./doc/en/xpu.md)).
-* **Apr 29, 2025**: Support AMX-Int8、 AMX-BF16 and Qwen3MoE ([Tutorial](./doc/en/AMX.md))
-* **Apr 9, 2025**: Experimental support for LLaMA 4 models ([Tutorial](./doc/en/llama4.md)).
-* **Apr 2, 2025**: Support Multi-concurrency. ([Tutorial](./doc/en/balance-serve.md)).
-* **Mar 15, 2025**: Support ROCm on AMD GPU ([Tutorial](./doc/en/ROCm.md)).
-* **Mar 5, 2025**: Support unsloth 1.58/2.51 bits weights and [IQ1_S/FP8 hybrid](./doc/en/fp8_kernel.md) weights. Support 139K [Longer Context](./doc/en/DeepseekR1_V3_tutorial.md#v022--v023-longer-context--fp8-kernel) for DeepSeek-V3 and R1 in 24GB VRAM.
-* **Feb 25, 2025**: Support [FP8 GPU kernel](./doc/en/fp8_kernel.md) for DeepSeek-V3 and R1; [Longer Context](./doc/en/DeepseekR1_V3_tutorial.md#v022-longer-context).
-* **Feb 15, 2025**: Longer Context (from 4K to 8K for 24GB VRAM) & Slightly Faster Speed （+15%, up to 16 Tokens/s), update [docs](./doc/en/DeepseekR1_V3_tutorial.md) and [online books](https://kvcache-ai.github.io/ktransformers/).
-* **Feb 10, 2025**: Support Deepseek-R1 and V3 on single (24GB VRAM)/multi gpu and 382G DRAM, up to 3~28x speedup. For detailed show case and reproduction tutorial, see [here](./doc/en/DeepseekR1_V3_tutorial.md).
-* **Aug 28, 2024**: Decrease DeepseekV2's required VRAM from 21G to 11G.
-* **Aug 15, 2024**: Update detailed [tutorial](doc/en/injection_tutorial.md) for injection and multi-GPU.
-* **Aug 14, 2024**: Support llamfile as linear backend.
-* **Aug 12, 2024**: Support multiple GPU; Support new model: mixtral 8\*7B  and 8\*22B; Support q2k, q3k, q5k dequant on gpu.
-* **Aug 9, 2024**: Support windows native.
+- Upstream clone: `KTransformers-repo/` (origin: `kvcache-ai/KTransformers`,
+  fork: `AGenchev/ktransformers`)
+- Dev container: `dev/Dockerfile` + `dev/dev.sh` (image `kt-dev-image:latest`,
+  container `kt-dev`, runs as UID 1000 matching host user `gele`)
+- Patch archive: `dev/patches/`
+- House rules and host quirks: see `AGENTS.md`
 
 ---
 
-## 📦 Capabilities
+## Applied changes: full-GPU prefill for LLAMAFILE MoE (issue #2108)
 
-### 🚀 [Inference](./kt-kernel/README.md) - High-Performance kt-kernel Serving
+### Background
 
-CPU-optimized kernel operations for heterogeneous LLM inference.
+`--kt-gpu-prefill-token-threshold` activates a **full-GPU prefill** path in
+sglang's KTransformers EP integration: when a prefill chunk reaches the
+token threshold, all MoE experts are dequantized into bf16 GPU staging
+buffers once per layer, so prefill runs entirely on GPU instead of the
+hybrid CPU/GPU pipeline.
 
-<img width="1049" height="593" alt="image" src="https://github.com/user-attachments/assets/68f423da-3f55-4025-bdc9-9ceaa554f00b" />
+That path calls `wrapper.submit_write_weight_scale_to_buffer()` /
+`sync_write_weight_scale_to_buffer()`. Two independent defects broke it:
 
+1. **Missing capability in the LLAMAFILE backend (kt-kernel).**
+   Only `NativeMoEWrapper` implemented the buffer-streaming methods. With
+   `--kt-method LLAMAFILE` (the GLM-5.3 configuration used here), the call
+   raised `AttributeError` and killed the scheduler
+   (ktransformers issues [#2108](https://github.com/kvcache-ai/KTransformers/issues/2108)
+   and #2113). The upstream fix attempt in PR #2111 ("move helpers to base")
+   would not have been enough: the LLAMAFILE C++ class `LLAMA_MOE_TP` had no
+   `write_weight_scale_to_buffer` task at all, so even with PR #2111 the
+   crash would have turned into `NotImplementedError`.
 
-**Key Features:**
-- **AMX/AVX Acceleration**: Intel AMX and AVX512/AVX2 optimized kernels for INT4/INT8 quantized inference
-- **MoE Optimization**: Efficient Mixture-of-Experts inference with NUMA-aware memory management
-- **Quantization Support**: CPU-side INT4/INT8 quantized weights, GPU-side GPTQ support
-- **Easy Integration**: Clean Python API for SGLang and other frameworks
+2. **Rank-asymmetric capability gate (sglang fork).**
+   The interim "Option A" patch gated the full-GPU path on
+   `hasattr(self.wrapper, "submit_write_weight_scale_to_buffer")`. The KT
+   wrapper object is constructed on **TP rank 0 only**, so rank 0 evaluated
+   the gate to `True` while ranks 1–3 saw `False`. Rank 0 entered the
+   full-GPU path and blocked inside `SharedFullContext`'s gloo collectives
+   while its peers took the hybrid path and enqueued different NCCL
+   collectives → 600 s NCCL watchdog timeout → SIGQUIT, scheduler death.
 
-**Quick Start:**
+### Change 1 — kt-kernel: `write_weights_to_buffer` for LLAMAFILE ("Suggestion C")
+
+Commit `e1cde21` (branch `fix/issue-2108-llamafile-write-weights`) on
+**AGenchev/ktransformers** (`main` tip and feature branch). Files:
+
+- `kt-kernel/operators/llamafile/moe.hpp`
+  - `LLAMA_MOE_TP::write_weights_to_buffer`: dequantizes this TP part's
+    local slice of the GGUF expert weights to bf16 into the GPU staging
+    buffers. TP mapping mirrors `load_weights()`: the outer `TP_MOE`
+    accumulates per-TP intermediate offsets (uneven CPU splits and
+    `cpu_tp_count != gpu_tp_count` supported); global row
+    `r = offset + r_local` maps to GPU slot `r / gpu_inter_local`, row
+    `r % gpu_inter_local`, where `gpu_inter_local =
+    full_config.intermediate_size / gpu_tp_count`. The down matrix maps
+    along its K (intermediate) axis the same way. Layout contract matches
+    sglang `kt_ep_wrapper._prepare_weight_bf16`:
+    `w13 = [2*gpu_inter_local, hidden]` (gate-then-up),
+    `w2 = [hidden, gpu_inter_local]`.
+  - `TP_MOE<LLAMA_MOE_TP>::write_weight_scale_to_buffer`: fans the task out
+    to all TP parts via `do_numa_job` after `load_weights()`.
+- `kt-kernel/python/utils/llamafile.py`
+  - `LlamafileMoEWrapper` gains `submit_write_weight_scale_to_buffer` /
+    `sync_write_weight_scale_to_buffer` with the same positional signature
+    as `NativeMoEWrapper`. Because sglang's gate is capability-based
+    (`hasattr`), the full-GPU path then activates automatically — no
+    further sglang configuration is needed.
+- `kt-kernel/test_write_buffer_llamafile.py` (included in the commit;
+  CPU-only functional
+  test): a 4-expert Q8_0 `LLAMA_MOE` (HIDDEN=512, INTER=2048 — must be
+  large enough to span 8 NUMA TP nodes) verifies the bf16 staging buffers
+  against the dequantized-Q8_0 reference for `gpu_tp_count=1` and
+  `gpu_tp_count=2`. Note: Q8_0 is lossy, so the reference dequantizes the
+  actual quantized bytes, not the original fp32.
+
+### Change 2 — sglang: rank-uniform full-GPU capability gate
+
+Commits `9f98335bd2` + `61bae41f9f`, branch
+`kt-ep/issue-2108-full-gpu-gate`, pushed to **AGenchev/sglang**
+(based on kvcache-ai/sglang `541ddc37cb`). No PR filed. Local copy:
+`third_party/sglang` (detached HEAD at `61bae41f9f`, `fork` remote added).
+Also archived as `dev/patches/sglang-issue2108-rank-uniform-gate.patch`
+(with the earlier interim patch kept as
+`dev/patches/sglang-issue2108-capability-gate.patch` for history, applied by
+`dev/patches/apply_rank_symmetric_gate.py`).
+
+In `python/sglang/srt/layers/moe/kt_ep_wrapper.py`:
+
+- New `_kt_wrapper_full_gpu_capable(method)`: rank 0 evaluates the wrapper
+  capability and **broadcasts the verdict over the gloo CPU group**, so
+  every TP rank takes the same branch; the result is cached per KT method.
+  Single-GPU / non-distributed runs short-circuit to the local check.
+- The full-GPU gate in `KTEPWrapperMethod.apply()` uses this rank-uniform
+  check; wrappers without the capability (e.g. stock AMX builds) skip the
+  full-GPU path with a one-time warning instead of crashing, falling back
+  to the hybrid CPU/GPU pipeline.
+
+> Editing note: the workspace `edit`/`write` tools reject any write to
+> `kt_ep_wrapper.py` (secret-detector false positive on the upstream
+> dataclass field `max_deferred_experts_per_token`). Apply changes to that
+> file via a script in `dev/patches/` executed from the host shell.
+
+### Result (verified end-to-end, 2026-10-02)
+
+GLM-5.3, LLAMAFILE method, Q5_K_XL CPU experts, 4×A100 TP4,
+`--kt-num-gpu-experts 12`, `--kt-gpu-prefill-token-threshold 512`:
+
+- 1456-token prompt → correct completion in ~54 s wall clock.
+- Full-GPU layerwise prefill runs clean through all 75 MoE layers
+  (~620–730 ms prepare + ~4 ms compute per layer; the first full-GPU pass
+  is slow by design because every expert is dequantized once per layer).
+- Launch script: `KTransformers-repo/ktransformers-glm53_LLAMAFILE-container-n12.sh`
+  (run inside the container via `./dev/dev.sh bash <script>`).
+
+### Rebuild / retest from scratch
+
 ```bash
-cd kt-kernel
-pip install .
+# kt-kernel (from KTransformers-repo/kt-kernel, inside the dev container)
+CCACHE_DIR=/tmp/ccache CPUINFER_PARALLEL=32 \
+  pip install . --no-deps --no-build-isolation --break-system-packages
+
+# sglang fork patch is already installed as an editable install:
+#   pip install --break-system-packages -e third_party/sglang/python
+# If the submodule is reset, re-apply via dev/patches/apply_rank_symmetric_gate.py
+
+# Functional test (kt-kernel)
+python test_write_buffer_llamafile.py
 ```
 
-**Use Cases:**
+Build gotchas: `/home/dev/.cache` is root-owned, hence `CCACHE_DIR=/tmp/ccache`;
+the LLAMAFILE test needs INTER large enough to span 8 NUMA TP nodes or it
+raises `intermediate_size too small`.
 
-- CPU-GPU hybrid inference for large MoE models
-- Integration with SGLang for production serving
-- Heterogeneous expert placement (hot experts on GPU, cold experts on CPU)
+### Upstream / maintenance notes
 
-**Performance Examples:**
-| Model | Hardware Configuration | Total Throughput | Output Throughput |
-|-------|------------------------|------------------|-------------------|
-| DeepSeek-R1-0528 (FP8) | 8×L20 GPU + Xeon Gold 6454S | 227.85 tokens/s | 87.58 tokens/s (8-way concurrency) |
-
-👉 **[Full Documentation →](./kt-kernel/README.md)**
+- Both fixes are **not merged upstream** as of 2026-10-05. Watch PR #2111
+  and the sglang fork; if an equivalent fix merges, the local sglang commits
+  can be dropped (`git -C third_party/sglang checkout -- <file>` / rebase).
+- Unpushed-history fallback: `dev/patches/*.patch` recreate both sglang
+  commits; the kt-kernel work is fully on the fork.
+- All kt-kernel artifacts created by docker must be `chown 1000:1000`
+  (host user `gele`); the dev container already runs as UID 1000.
 
 ---
 
-### 🎓 [SFT](./doc/en/SFT/KTransformers-Fine-Tuning_Cookbook.md) - Fine-Tuning with LlamaFactory
+## Workspace layout
 
-KTransformers × LlamaFactory integration for ultra-large MoE model fine-tuning. The new Cookbook provides an easy-to-use path from hardware checks and installation to BF16/FP8/INT8 configuration, LoRA/full training, resource planning, and troubleshooting.
-
-**Kimi K2.5 / K2.6 LoRA fine-tuning** is supported with native RAWINT4 routed experts. Follow the [PyPI installation, training, resume and SGLang serving guide (中文)](./.github/release/examples/kimi-k25/README.md). End-to-end validation uses Kimi K2.5; K2.6 follows the same model-architecture path.
-
-![LlamaFactory and KTransformers MoE fine-tuning architecture](./doc/assets/llamafactory-kt-integration-overview.png)
-
-**Key Features:**
-- **Multi-Backend Support**: CPU/GPU hybrid fine-tuning with INT8/INT4 quantization
-- **Ultra-Large MoE Support**: Fine-tune models like DeepSeek-V3/R1 on limited GPU memory
-- **Faster than ZeRO-Offload**: 6-12x training speedup in benchmarked MoE SFT workloads
-- **Lower CPU Memory**: About half the CPU memory of the previous KT SFT path in the benchmarked setup
-- **LlamaFactory Integration**: Seamless integration with the popular fine-tuning framework
-
-| Model | GPU Memory | Training Speed | Hardware |
-|-------|------------|----------------|----------|
-| DeepSeek-V3 | ~80GB total | 3.7 it/s | 4x RTX 4090 |
-| DeepSeek-R1 | ~80GB total | 3.7 it/s | 4x RTX 4090 |
-| Qwen3-30B-A3B | ~24GB total | 8+ it/s | 1x RTX 4090 |
-
-**Quick Start:**
-```bash
-cd /path/to/LLaMA-Factory
-python -m pip install -e .
-python -m pip install "ktransformers[sft]==0.7.0"
-python -m pip install "sglang-kt==0.7.0"
-CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
-  --config_file examples/ktransformers/accelerate/fsdp2_kt_int8.yaml \
-  src/train.py \
-  examples/ktransformers/train_lora/qwen3_5moe_lora_sft_kt.yaml
 ```
-
-👉 **[Easy-to-Use Fine-Tuning Cookbook →](./doc/en/SFT/KTransformers-Fine-Tuning_Cookbook.md)**
-👉 **[Quick Start →](./doc/en/SFT/KTransformers-Fine-Tuning_Quick-Start.md)**
-👉 **[Full Documentation →](./doc/en/SFT/KTransformers-Fine-Tuning_User-Guide.md)**
-
----
-
-## 🔥 Citation
-
-If you use KTransformers in your research, please cite our paper:
-
-```bibtex
-@inproceedings{10.1145/3731569.3764843,
-  title = {KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models},
-  author = {Chen, Hongtao and Xie, Weiyu and Zhang, Boxin and Tang, Jingqi and Wang, Jiahao and Dong, Jianwei and Chen, Shaoyuan and Yuan, Ziwei and Lin, Chen and Qiu, Chengyu and Zhu, Yuening and Ou, Qingliang and Liao, Jiaqi and Chen, Xianglin and Ai, Zhiyuan and Wu, Yongwei and Zhang, Mingxing},
-  booktitle = {Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles},
-  year = {2025}
-}
+K-transformers/
+├── AGENTS.md                     # host quirks, credentials policy, layout
+├── README.md                     # this file
+├── dev/
+│   ├── Dockerfile, dev.sh        # dev container (kt-dev-image, UID 1000)
+│   ├── patches/                  # archived sglang patches + apply script
+│   └── ccache/, pip-cache/, hf-cache/, home/   # persistent caches
+└── KTransformers-repo/           # upstream clone (origin) + fork remote
+    ├── kt-kernel/                # C++/CUDA kernels; fix branch committed here
+    └── third_party/
+        ├── sglang/               # kvcache-ai fork; local gate commits here
+        ├── llama.cpp, custom_flashinfer, pybind11
+        └── ...
 ```
-
-## 👥 Contributors & Team
-
-Developed and maintained by:
-- [MADSys Lab](https://madsys.cs.tsinghua.edu.cn/) @ Tsinghua University
-- [Approaching.AI](http://approaching.ai/)
-- [9#AISoft](https://github.com/aisoft9)
-- Community contributors
-
-We welcome contributions! Please feel free to submit issues and pull requests.
-
-## 💬 Community & Support
-
-- **GitHub Issues**: [Report bugs or request features](https://github.com/kvcache-ai/ktransformers/issues)
-- **WeChat Group**: See [archive/WeChatGroup.png](./archive/WeChatGroup.png)
-
-## 📦 KT original Code
-
-The original integrated KTransformers framework has been archived to the [`archive/`](./archive/) directory for reference. The project now organizes the two capabilities above from the kt-kernel source tree for clearer documentation and maintenance.
-
-For the original documentation with full quick-start guides and examples, see:
-- [archive/README.md](./archive/README.md) (English)
-- [archive/README_ZH.md](./archive/README_ZH.md) (中文)
