@@ -295,3 +295,29 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
         """Block until previously submitted write_weight_scale_to_buffer tasks finish."""
         # The CPUInfer.sync() call blocks until pending tasks complete.
         self.cpu_infer.sync()
+
+    # ------------------------------------------------------------------
+    # BF16 expert pool (KT_BF16_EXPERT_POOL) direct-DMA support.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def kt_bf16_pool_info():
+        """Geometry + enablement of the optional pre-dequantized BF16 pool.
+
+        Returns a dict {enabled, pinned, n_experts, inter, hidden, layer_ids};
+        pinning (cudaHostRegister of the mmap) happens lazily on first call.
+        """
+        from kt_kernel_ext import kt_bf16_pool_info as _pool_info
+
+        return _pool_info()
+
+    @staticmethod
+    def kt_bf16_pool_expert_source(layer_idx: int, hidden: int, inter_full: int, expert_num: int, expert_id: int):
+        """Source pointers + geometry for one (layer, expert) of the pool.
+
+        Returns {valid, gate_ptr, up_ptr, down_ptr, full_inter, hidden}; the
+        pointers are stable for the process lifetime (the mmap is never
+        unmapped). valid=False means the caller must use the staged path.
+        """
+        from kt_kernel_ext import kt_bf16_pool_expert_source as _pool_src
+
+        return _pool_src(layer_idx, hidden, inter_full, expert_num, expert_id)

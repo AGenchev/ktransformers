@@ -580,6 +580,26 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   m.def("initialize_fp8_layerwise_control", &kt::layerwise::initialize_fp8_layerwise_control,
         py::arg("control_ptr"), py::arg("control_size"), py::arg("tp_size"));
 
+  // BF16 expert pool (KT_BF16_EXPERT_POOL): geometry query + per-expert source
+  // pointers for sglang's direct-DMA prefill prep. Pool pinning happens lazily
+  // inside kt_bf16_pool_info().
+  m.def("kt_bf16_pool_info",
+        []() {
+          auto i = kt_bf16_pool_info();
+          return py::dict(py::arg("enabled") = i.enabled, py::arg("pinned") = i.pinned,
+                          py::arg("n_experts") = i.n_experts, py::arg("inter") = i.inter,
+                          py::arg("hidden") = i.hidden, py::arg("layer_ids") = std::vector<int32_t>(
+                              i.layer_ids, i.layer_ids + i.n_layers));
+        });
+  m.def("kt_bf16_pool_expert_source",
+        [](int layer_idx, int64_t hidden, int64_t inter_full, int64_t expert_num, int expert_id) {
+          auto s = kt_bf16_pool_expert_source(layer_idx, hidden, inter_full, expert_num, expert_id);
+          return py::dict(py::arg("valid") = s.valid, py::arg("gate_ptr") = s.gate_ptr, py::arg("up_ptr") = s.up_ptr,
+                          py::arg("down_ptr") = s.down_ptr, py::arg("full_inter") = s.full_inter,
+                          py::arg("hidden") = s.hidden);
+        },
+        py::arg("layer_idx"), py::arg("hidden"), py::arg("inter_full"), py::arg("expert_num"), py::arg("expert_id"));
+
   py::class_<kt::layerwise::FP8LayerwiseTransport, std::shared_ptr<kt::layerwise::FP8LayerwiseTransport>>(
       m, "FP8LayerwiseTransport")
       .def(py::init<std::uintptr_t, std::size_t, int, int, int, const std::vector<std::uintptr_t>&,

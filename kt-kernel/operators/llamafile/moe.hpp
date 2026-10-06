@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -131,6 +133,7 @@ inline bool kt_json_find_int_array(const std::string& s, const char* key, std::v
 
 struct KtBf16PoolState {
   std::atomic<bool> enabled{false};
+  std::atomic<bool> pinned{false};
   int fd = -1;
   void* map_base = nullptr;
   size_t map_bytes = 0;
@@ -223,7 +226,9 @@ struct KtBf16PoolState {
     }
 
     const std::string bin_path = std::string(dir) + "/pool.bin";
-    fd = ::open(bin_path.c_str(), O_RDONLY);
+    // O_RDWR so the mapping can be PROT_WRITE (required for
+    // cudaHostRegister); we never write to the pool file.
+    fd = ::open(bin_path.c_str(), O_RDWR);
     if (fd < 0) {
       disable("cannot open pool.bin");
       return false;
@@ -235,7 +240,10 @@ struct KtBf16PoolState {
       fd = -1;
       return false;
     }
-    void* m = ::mmap(nullptr, (size_t)total, PROT_READ, MAP_PRIVATE, fd, 0);
+    // MAP_SHARED + PROT_READ|PROT_WRITE (file opened read-only; we never
+    // write) so the mapping is registerable by cudaHostRegister. MAP_PRIVATE
+    // read-only mappings are rejected by cudaHostRegister with invalid arg.
+    void* m = ::mmap(nullptr, (size_t)total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (m == MAP_FAILED) {
       disable("mmap of pool.bin failed");
       ::close(fd);
@@ -245,6 +253,51 @@ struct KtBf16PoolState {
     ::madvise(m, (size_t)total, MADV_WILLNEED);
     map_base = m;
     map_bytes = (size_t)total;
+
+    // Optional eager prefetch: MADV_WILLNEED only hints; the first request
+    // would otherwise pay the whole-pool NVMe stream (~1.4 TB for GLM-5.3).
+    // KT_POOL_PREFETCH=1 spawns ONE background thread that fault-reads the
+    // whole mapping at open (overlapping sglang's weight load), so the pool
+    // is page-cache resident by the first request. Default: off.
+    {
+      const char* pf = std::getenv("KT_POOL_PREFETCH");
+      if (pf && pf[0] == '1') {
+        auto* base = (volatile uint8_t*)m;
+        const size_t bytes = (size_t)total;
+        std::thread([base, bytes] {
+          const auto t0 = std::chrono::steady_clock::now();
+          // Touch one byte per page: a page-fault read pulls the full page in.
+          const size_t page = 4096;
+          size_t touched = 0;
+          for (size_t off = 0; off < bytes; off += page) {
+            volatile uint8_t sink = base[off];
+            (void)sink;
+            touched += page;
+            if ((touched & 0xFFFFFFFULL) < page) {  // ~every 4 GiB, log progress
+              const auto el = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::steady_clock::now() - t0)
+                                  .count();
+              fprintf(stderr, "[KtBf16Pool] prefetch %zu/%zu GiB (%lld s)\n", touched >> 30, bytes >> 30,
+                      (long long)el);
+              fflush(stderr);
+            }
+          }
+          // Keep the pool resident: without locking, the kernel trades pool
+          // pages against other containers' cache and warm passes degrade
+          // toward disk speed (observed ~2.6 s/layer with swap churn).
+          if (::mlock((const void*)base, bytes) != 0) {
+            fprintf(stderr, "[KtBf16Pool] mlock failed (errno=%d); pool may be swapped out\n", errno);
+            fflush(stderr);
+          }
+          const auto el = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+          fprintf(stderr, "[KtBf16Pool] prefetch done: %zu GiB in %lld s (locked)\n", bytes >> 30,
+                  (long long)el);
+          fflush(stderr);
+        }).detach();
+      }
+    }
     n_experts = experts;
     inter = inter_v;
     hidden = hidden_v;
@@ -283,6 +336,101 @@ inline KtBf16PoolExpertPtrs kt_bf16_pool_resolve(int layer_idx, int64_t hidden, 
                                                  int expert_id) {
   kt_bf16_pool_warm();
   return kt_bf16_pool_state().resolve(layer_idx, hidden, inter_full, expert_num, expert_id);
+}
+
+#ifdef KTRANSFORMERS_USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
+// Pin the pool mapping into CUDA-addressable pinned memory so sglang can
+// cudaMemcpyAsync directly from it, skipping the CPU staging buffer. Best
+// effort: if registration fails (e.g. RLIMIT_MEMLOCK below the pool size, or
+// no CUDA context), direct DMA must not be attempted (unpinned-src async
+// copies silently synchronize and would serialize the pipeline). Runs once,
+// lazily, thread-safe; never unregistered (mmap lives for the process).
+inline bool kt_bf16_pool_ensure_registered() {
+  auto& state = kt_bf16_pool_state();
+  static std::once_flag reg_once;
+  std::call_once(reg_once, [] {
+    auto& st = kt_bf16_pool_state();
+    if (!st.enabled.load(std::memory_order_acquire) || st.map_base == nullptr) return;
+#ifdef KTRANSFORMERS_USE_CUDA
+    void* p = st.map_base;
+    size_t n = st.map_bytes;
+    cudaError_t err = cudaHostRegister(p, n, cudaHostRegisterDefault);
+    if (err == cudaSuccess) {
+      st.pinned.store(true, std::memory_order_release);
+      printf("[KtBf16Pool] pinned %zu GiB for direct DMA\n", n >> 30);
+    } else {
+      printf("[KtBf16Pool] cudaHostRegister failed (%s); direct DMA disabled\n", cudaGetErrorString(err));
+    }
+    fflush(stdout);
+#else
+    fprintf(stderr, "[KtBf16Pool] built without CUDA; direct DMA disabled\n");
+    fflush(stderr);
+#endif
+  });
+#ifdef KTRANSFORMERS_USE_CUDA
+  return state.pinned.load(std::memory_order_acquire);
+#else
+  return false;
+#endif
+}
+
+// Geometry + enablement query for the direct-DMA consumer (sglang).
+// All fields are immutable after open; safe to read from any thread.
+struct KtBf16PoolInfo {
+  bool enabled = false;
+  bool pinned = false;
+  int64_t n_experts = 0;
+  int64_t inter = 0;   // full intermediate size
+  int64_t hidden = 0;
+  int32_t n_layers = 0;
+  int32_t layer_ids[512] = {};  // moe_layer_ids, ascending as in pool.json
+};
+
+inline KtBf16PoolInfo kt_bf16_pool_info() {
+  kt_bf16_pool_warm();
+  kt_bf16_pool_ensure_registered();
+  auto& st = kt_bf16_pool_state();
+  KtBf16PoolInfo info;
+  info.enabled = st.enabled.load(std::memory_order_acquire);
+  info.pinned = kt_bf16_pool_ensure_registered();
+  info.n_experts = st.n_experts;
+  info.inter = st.inter;
+  info.hidden = st.hidden;
+  const size_t n = st.moe_layer_ids.size();
+  info.n_layers = (int32_t)std::min<size_t>(n, 512);
+  for (int32_t i = 0; i < info.n_layers; i++) info.layer_ids[i] = (int32_t)st.moe_layer_ids[i];
+  return info;
+}
+
+// Source pointers + geometry for one (layer, expert). Returns valid=false if
+// the pool cannot serve this expert (disabled, dim mismatch, dense layer, or
+// out of range). Pointers are stable for the process lifetime (never unmapped).
+struct KtBf16PoolSource {
+  bool valid = false;
+  uint64_t gate_ptr = 0;  // [inter, hidden] bf16 rows
+  uint64_t up_ptr = 0;    // [inter, hidden] bf16 rows
+  uint64_t down_ptr = 0;  // [hidden, inter] bf16 rows
+  int64_t full_inter = 0;
+  int64_t hidden = 0;
+};
+
+inline KtBf16PoolSource kt_bf16_pool_expert_source(int layer_idx, int64_t hidden_want, int64_t inter_full_want,
+                                                   int64_t expert_num_want, int expert_id) {
+  kt_bf16_pool_warm();
+  KtBf16PoolSource s;
+  auto ptrs = kt_bf16_pool_state().resolve(layer_idx, hidden_want, inter_full_want, expert_num_want, expert_id);
+  if (!ptrs) return s;
+  auto& st = kt_bf16_pool_state();
+  s.valid = true;
+  s.gate_ptr = (uint64_t)ptrs.gate;
+  s.up_ptr = (uint64_t)ptrs.up;
+  s.down_ptr = (uint64_t)ptrs.down;
+  s.full_inter = st.inter;
+  s.hidden = st.hidden;
+  return s;
 }
 
 // ---------------------------------------------------------------------------
