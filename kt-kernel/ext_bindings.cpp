@@ -587,6 +587,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
         []() {
           auto i = kt_bf16_pool_info();
           return py::dict(py::arg("enabled") = i.enabled, py::arg("pinned") = i.pinned,
+                          py::arg("memfd") = i.memfd,
                           py::arg("n_experts") = i.n_experts, py::arg("inter") = i.inter,
                           py::arg("hidden") = i.hidden, py::arg("layer_ids") = std::vector<int32_t>(
                               i.layer_ids, i.layer_ids + i.n_layers));

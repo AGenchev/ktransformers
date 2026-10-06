@@ -18,6 +18,7 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 # downgrade TP mem imbalance to
 export KT_BF16_EXPERT_POOL=/work/models/GLM-5.3-bf16-expert-pool
 export KT_POOL_DIRECT_DMA=1
 export KT_POOL_PREFETCH=1
+export KT_POOL_MEMFD=1 # shmem replica of the pool -> cudaHostRegister works -> direct DMA active
 
 python -m sglang.launch_server \
   --model /work/weights/GLM-5.3-BF16 \

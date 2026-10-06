@@ -5,7 +5,7 @@
 #endif
 #include <numa.h>
 #include <numaif.h>
-#include <fcntl.h>     // open (BF16 expert pool mmap)
+#include <fcntl.h>     // open (BF16 expert pool mmap), memfd_create, posix_fadvise
 #include <sys/mman.h>  // madvise / MADV_WILLNEED (warm the aliased GGUF mmap into page cache)
 #include <sys/stat.h>  // fstat (BF16 expert pool size check)
 #include <unistd.h>    // sysconf(_SC_PAGESIZE)
@@ -98,6 +98,16 @@ struct KtBf16PoolExpertPtrs {
   explicit operator bool() const { return gate != nullptr; }
 };
 
+// Reusable I/O buffer for the memfd streaming copy: lazily grows a heap
+// vector when the chunk is bigger than 4 MiB, else uses a stack scratch.
+inline char* kt_pool_io_buf(std::vector<char>& heap, size_t n) {
+  constexpr size_t STACK_BYTES = 4 << 20;
+  static thread_local char stack_buf[STACK_BYTES];
+  if (n <= STACK_BYTES) return stack_buf;
+  heap.resize(n);
+  return heap.data();
+}
+
 inline bool kt_json_find_int(const std::string& s, const char* key, int64_t& out) {
   const std::string pat = "\"" + std::string(key) + "\"";
   size_t p = s.find(pat);
@@ -134,8 +144,9 @@ inline bool kt_json_find_int_array(const std::string& s, const char* key, std::v
 struct KtBf16PoolState {
   std::atomic<bool> enabled{false};
   std::atomic<bool> pinned{false};
-  int fd = -1;
-  void* map_base = nullptr;
+  int fd = -1;               // pool.bin file descriptor (always the disk file)
+  int memfd = -1;            // memfd replica fd when KT_POOL_MEMFD=1, else -1
+  void* map_base = nullptr;  // mapping used by the compute path (memfd or file)
   size_t map_bytes = 0;
   int64_t n_experts = 0, inter = 0, hidden = 0;
   size_t per_expert_bytes = 0;
@@ -243,12 +254,105 @@ struct KtBf16PoolState {
     // MAP_SHARED + PROT_READ|PROT_WRITE (file opened read-only; we never
     // write) so the mapping is registerable by cudaHostRegister. MAP_PRIVATE
     // read-only mappings are rejected by cudaHostRegister with invalid arg.
-    void* m = ::mmap(nullptr, (size_t)total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (m == MAP_FAILED) {
-      disable("mmap of pool.bin failed");
-      ::close(fd);
-      fd = -1;
-      return false;
+    // Two mapping modes:
+    //
+    //  - file mode (default): MAP_SHARED mapping of pool.bin. Never
+    //    registerable with cudaHostRegister (the kernel refuses long-term
+    //    pins of file-backed page cache), so direct DMA stays dormant, but
+    //    it costs no extra RAM beyond page cache.
+    //
+    //  - memfd mode (KT_POOL_MEMFD=1): copy pool.bin into an anonymous
+    //    shmem memfd in 1 GiB chunks (dropping the source page cache with
+    //    posix_fadvise(DONTNEED) as we go) and map THAT. Shmem mappings
+    //    register successfully, enabling the sglang direct-DMA branch.
+    //    Costs one extra RAM-resident copy of the pool (must fit alongside
+    //    the mlock'd mapping); falls back to file mode when allocation or
+    //    the copy fails at any point.
+    //
+    // The prefetched/pinned requirement (KT_POOL_PREFETCH=1) applies to
+    // both modes.
+    void* m = nullptr;
+    {
+      const char* memfd_env = std::getenv("KT_POOL_MEMFD");
+      const bool want_memfd = memfd_env && memfd_env[0] == '1';
+      if (want_memfd) {
+        memfd = ::memfd_create("kt_bf16_expert_pool", 0);
+        if (memfd < 0) {
+          fprintf(stderr, "[KtBf16Pool] memfd_create failed (errno=%d); using file mapping\n", errno);
+          fflush(stderr);
+        }
+      }
+      if (memfd >= 0) {
+        if (::ftruncate(memfd, (off_t)total) != 0) {
+          fprintf(stderr, "[KtBf16Pool] memfd ftruncate failed (errno=%d); using file mapping\n", errno);
+          fflush(stderr);
+          ::close(memfd);
+          memfd = -1;
+        }
+      }
+      if (memfd >= 0) {
+        // Stream file -> memfd in 1 GiB chunks; drop the source page cache
+        // behind the read cursor so peak usage stays ~1 copy + 1 chunk.
+        constexpr size_t CHUNK = 1ull << 30;
+        std::vector<char> zchunk;
+        bool copy_ok = true;
+        for (size_t off = 0; off < (size_t)total && copy_ok; off += CHUNK) {
+          const size_t n = std::min(CHUNK, (size_t)total - off);
+          size_t done = 0;
+          while (done < n) {
+            const ssize_t r = ::pread(fd, kt_pool_io_buf(zchunk, n), n - done, (off_t)(off + done));
+            if (r <= 0) {
+              copy_ok = false;
+              break;
+            }
+            size_t w = 0;
+            while (w < (size_t)r) {
+              const ssize_t s = ::pwrite(memfd, kt_pool_io_buf(zchunk, n) + done + w, (size_t)r - w,
+                                         (off_t)(off + done + w));
+              if (s <= 0) {
+                copy_ok = false;
+                break;
+              }
+              w += (size_t)s;
+            }
+            if (!copy_ok) break;
+            done += (size_t)r;
+          }
+          if (copy_ok) {
+            // Page cache of the disk file is not needed after the chunk copy.
+            ::posix_fadvise(fd, (off_t)off, (off_t)n, POSIX_FADV_DONTNEED);
+          }
+        }
+        if (!copy_ok) {
+          fprintf(stderr, "[KtBf16Pool] memfd copy failed; using file mapping\n");
+          fflush(stderr);
+          ::close(memfd);
+          memfd = -1;
+        }
+      }
+      if (memfd >= 0) {
+        m = ::mmap(nullptr, (size_t)total, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+        if (m == MAP_FAILED) {
+          fprintf(stderr, "[KtBf16Pool] memfd mmap failed; using file mapping\n");
+          fflush(stderr);
+          ::close(memfd);
+          memfd = -1;
+          m = nullptr;
+        } else {
+          printf("[KtBf16Pool] memfd replica ready (%.1f GiB, registerable)\n",
+                 (double)total / (1024.0 * 1024.0 * 1024.0));
+          fflush(stdout);
+        }
+      }
+      if (m == nullptr) {
+        m = ::mmap(nullptr, (size_t)total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (m == MAP_FAILED) {
+          disable("mmap of pool.bin failed");
+          ::close(fd);
+          fd = -1;
+          return false;
+        }
+      }
     }
     ::madvise(m, (size_t)total, MADV_WILLNEED);
     map_base = m;
@@ -259,13 +363,17 @@ struct KtBf16PoolState {
     // KT_POOL_PREFETCH=1 spawns ONE background thread that fault-reads the
     // whole mapping at open (overlapping sglang's weight load), so the pool
     // is page-cache resident by the first request. Default: off.
+    // In memfd mode the mapping is already fully populated by the copy
+    // phase, so the thread only needs to mlock (no disk re-read).
     {
       const char* pf = std::getenv("KT_POOL_PREFETCH");
       if (pf && pf[0] == '1') {
         auto* base = (volatile uint8_t*)m;
         const size_t bytes = (size_t)total;
-        std::thread([base, bytes] {
+        const bool already_resident = (memfd >= 0);  // copy phase populated it
+        std::thread([base, bytes, already_resident] {
           const auto t0 = std::chrono::steady_clock::now();
+          if (!already_resident) {
           // Touch one byte per page: a page-fault read pulls the full page in.
           const size_t page = 4096;
           size_t touched = 0;
@@ -282,9 +390,11 @@ struct KtBf16PoolState {
               fflush(stderr);
             }
           }
+          }  // !already_resident
           // Keep the pool resident: without locking, the kernel trades pool
           // pages against other containers' cache and warm passes degrade
-          // toward disk speed (observed ~2.6 s/layer with swap churn).
+          // toward disk speed (observed ~2.6 s/layer with swap churn). In
+          // memfd mode the pages are shmem; mlock keeps them from swapping.
           if (::mlock((const void*)base, bytes) != 0) {
             fprintf(stderr, "[KtBf16Pool] mlock failed (errno=%d); pool may be swapped out\n", errno);
             fflush(stderr);
@@ -292,8 +402,8 @@ struct KtBf16PoolState {
           const auto el = std::chrono::duration_cast<std::chrono::seconds>(
                               std::chrono::steady_clock::now() - t0)
                               .count();
-          fprintf(stderr, "[KtBf16Pool] prefetch done: %zu GiB in %lld s (locked)\n", bytes >> 30,
-                  (long long)el);
+          fprintf(stderr, "[KtBf16Pool] prefetch done: %zu GiB in %lld s (locked%s)\n", bytes >> 30,
+                  (long long)el, already_resident ? ", memfd resident" : "");
           fflush(stderr);
         }).detach();
       }
@@ -382,6 +492,7 @@ inline bool kt_bf16_pool_ensure_registered() {
 struct KtBf16PoolInfo {
   bool enabled = false;
   bool pinned = false;
+  bool memfd = false;  // mapping is a registerable shmem replica
   int64_t n_experts = 0;
   int64_t inter = 0;   // full intermediate size
   int64_t hidden = 0;
@@ -396,6 +507,7 @@ inline KtBf16PoolInfo kt_bf16_pool_info() {
   KtBf16PoolInfo info;
   info.enabled = st.enabled.load(std::memory_order_acquire);
   info.pinned = kt_bf16_pool_ensure_registered();
+  info.memfd = (st.memfd >= 0);
   info.n_experts = st.n_experts;
   info.inter = st.inter;
   info.hidden = st.hidden;
