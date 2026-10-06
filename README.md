@@ -132,10 +132,17 @@ replaces per-layer GGUF dequantization as the row source of
   keeps dequant behavior. The dequant path is unchanged
   (`test_write_buffer_llamafile.py` still passes).
 - E2E (GLM-5.3, 4×A100 TP4, chunk 12288, 256 experts × 76 layers,
-  1.4 TB pool): first pass is NVMe-bound (~7.8 s/layer, streaming the pool
-  from disk); warm page-cache passes drop to ~0.48 s/layer and 37–44 s wall
-  for a ~9k-token prefill vs 52.7 s for the GGUF-dequant baseline at steady
-  state (~2.2 TB RAM host keeps the whole pool cacheable).
+  1.4 TB pool): first pass is NVMe-bound (~7.8 s/layer) unless
+  `KT_POOL_PREFETCH=1` makes a background thread stream + mlock the pool at
+  startup (overlapping model load); warm passes then run at ~0.39–0.48 s
+  per layer and 29–39 s wall for a ~9k-token prefill vs 52.7 s for the
+  GGUF-dequant baseline. mlock matters: without it the kernel swaps pool
+  pages away and warm passes degrade to ~2.6 s/layer.
+- Direct DMA (attempted): sglang-side branch (KT_POOL_DIRECT_DMA=1) copies
+  pool→GPU per rank, skipping the staging buffer — implemented and shipped
+  (kt-kernel pin/query API + sglang branch), but dormant on this host
+  because the driver rejects cudaHostRegister of file-backed mappings even
+  with unlimited memlock; the staged path serves requests instead.
 
 ### Result (verified end-to-end, 2026-10-02)
 
