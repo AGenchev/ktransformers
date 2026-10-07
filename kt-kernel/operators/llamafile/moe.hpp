@@ -291,23 +291,33 @@ struct KtBf16PoolState {
         }
       }
       if (memfd >= 0) {
-        // Stream file -> memfd in 1 GiB chunks; drop the source page cache
-        // behind the read cursor so peak usage stays ~1 copy + 1 chunk.
-        constexpr size_t CHUNK = 1ull << 30;
-        std::vector<char> zchunk;
+        // Stream file -> memfd in 4 GiB chunks; drop the source page cache
+        // in batches so peak usage stays ~1 copy + 1 batch. A time-based
+        // progress line every ~15 s (with MB/s) keeps liveness observable
+        // even when a 4 GiB chunk takes tens of seconds.
+        const auto t_copy = std::chrono::steady_clock::now();
+        constexpr size_t CHUNK = 4ull << 30;
+        constexpr int DONTNEED_BATCH = 4;  // drop cache every 4 chunks
+        std::vector<char> heap_buf;
         bool copy_ok = true;
+        int chunks_done = 0;
+        off_t batch_start = 0;
+        size_t batch_bytes = 0;
+        size_t last_logged_off = 0;
+        auto last_log_t = t_copy;
         for (size_t off = 0; off < (size_t)total && copy_ok; off += CHUNK) {
           const size_t n = std::min(CHUNK, (size_t)total - off);
+          char* buf = kt_pool_io_buf(heap_buf, n);
           size_t done = 0;
           while (done < n) {
-            const ssize_t r = ::pread(fd, kt_pool_io_buf(zchunk, n), n - done, (off_t)(off + done));
+            const ssize_t r = ::pread(fd, buf + done, n - done, (off_t)(off + done));
             if (r <= 0) {
               copy_ok = false;
               break;
             }
             size_t w = 0;
             while (w < (size_t)r) {
-              const ssize_t s = ::pwrite(memfd, kt_pool_io_buf(zchunk, n) + done + w, (size_t)r - w,
+              const ssize_t s = ::pwrite(memfd, buf + done + w, (size_t)r - w,
                                          (off_t)(off + done + w));
               if (s <= 0) {
                 copy_ok = false;
@@ -317,31 +327,49 @@ struct KtBf16PoolState {
             }
             if (!copy_ok) break;
             done += (size_t)r;
+            const auto now = std::chrono::steady_clock::now();
+            const double since = std::chrono::duration<double>(now - last_log_t).count();
+            if (since >= 15.0) {
+              const auto el =
+                  std::chrono::duration_cast<std::chrono::seconds>(now - t_copy).count();
+              const double mbps = (double)((off + done) - last_logged_off) / since / (1024.0 * 1024.0);
+              fprintf(stderr, "[KtBf16Pool] memfd copy %zu/%zu GiB (%lld s, %.0f MB/s)\n",
+                      (off + done) >> 30, (size_t)total >> 30, (long long)el, mbps);
+              fflush(stderr);
+              last_logged_off = off + done;
+              last_log_t = now;
+            }
           }
-          if (copy_ok) {
-            // Page cache of the disk file is not needed after the chunk copy.
-            ::posix_fadvise(fd, (off_t)off, (off_t)n, POSIX_FADV_DONTNEED);
+          if (!copy_ok) break;
+          chunks_done++;
+          batch_bytes += n;
+          if (chunks_done % DONTNEED_BATCH == 0) {
+            ::posix_fadvise(fd, batch_start, (off_t)batch_bytes, POSIX_FADV_DONTNEED);
+            batch_start = (off_t)(off + n);
+            batch_bytes = 0;
           }
+        }
+        if (batch_bytes > 0 && copy_ok) {
+          ::posix_fadvise(fd, batch_start, (off_t)batch_bytes, POSIX_FADV_DONTNEED);
         }
         if (!copy_ok) {
           fprintf(stderr, "[KtBf16Pool] memfd copy failed; using file mapping\n");
           fflush(stderr);
           ::close(memfd);
           memfd = -1;
-        }
-      }
-      if (memfd >= 0) {
-        m = ::mmap(nullptr, (size_t)total, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-        if (m == MAP_FAILED) {
-          fprintf(stderr, "[KtBf16Pool] memfd mmap failed; using file mapping\n");
-          fflush(stderr);
-          ::close(memfd);
-          memfd = -1;
-          m = nullptr;
         } else {
-          printf("[KtBf16Pool] memfd replica ready (%.1f GiB, registerable)\n",
-                 (double)total / (1024.0 * 1024.0 * 1024.0));
-          fflush(stdout);
+          m = ::mmap(nullptr, (size_t)total, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+          if (m == MAP_FAILED) {
+            fprintf(stderr, "[KtBf16Pool] memfd mmap failed; using file mapping\n");
+            fflush(stderr);
+            ::close(memfd);
+            memfd = -1;
+            m = nullptr;
+          } else {
+            printf("[KtBf16Pool] memfd replica ready (%.1f GiB, registerable)\n",
+                   (double)total / (1024.0 * 1024.0 * 1024.0));
+            fflush(stdout);
+          }
         }
       }
       if (m == nullptr) {
