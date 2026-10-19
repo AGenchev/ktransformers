@@ -423,8 +423,33 @@ struct KtBf16PoolState {
           // pages against other containers' cache and warm passes degrade
           // toward disk speed (observed ~2.6 s/layer with swap churn). In
           // memfd mode the pages are shmem; mlock keeps them from swapping.
-          if (::mlock((const void*)base, bytes) != 0) {
-            fprintf(stderr, "[KtBf16Pool] mlock failed (errno=%d); pool may be swapped out\n", errno);
+          //
+          // SAFETY: mlock'd pages are UNEVICTABLE - mlocking the whole pool
+          // removes ~pool_bytes from the kernel's reclaimable supply for ALL
+          // cgroups on the host. On the 2.2 TiB GLM-5.3 host this pushed the
+          // container's global footprint past the point where the kernel
+          // OOM-killed a scheduler rank mid-request (cgroup memory.peak
+          // 2.18 TiB, memory.events oom_kill=2; silent SIGKILL -> rank0 TCPStore
+          // drop -> 600 s NCCL watchdog on ranks 1-3). Default is now OFF;
+          // KT_POOL_LOCK_MAX_MB opts in with a byte cap (0 = unlimited, at
+          // your own risk). A failed mlock on the capped range is non-fatal:
+          // the pool stays page-cache resident and mlock is best effort.
+          long lock_max_mb = 0;
+          if (const char* lm = std::getenv("KT_POOL_LOCK_MAX_MB")) {
+            lock_max_mb = std::strtol(lm, nullptr, 10);
+            if (lock_max_mb < 0) lock_max_mb = 0;
+          }
+          if (lock_max_mb != 0) {
+            const size_t lock_bytes = std::min<size_t>(
+                bytes, static_cast<size_t>(lock_max_mb) * 1024ULL * 1024ULL);
+            if (::mlock((const void*)base, lock_bytes) != 0) {
+              fprintf(stderr, "[KtBf16Pool] mlock failed (errno=%d); pool may be swapped out\n", errno);
+              fflush(stderr);
+            }
+          } else {
+            fprintf(stderr,
+                    "[KtBf16Pool] mlock disabled by default (KT_POOL_LOCK_MAX_MB unset); "
+                    "pool relies on page cache\n");
             fflush(stderr);
           }
           const auto el = std::chrono::duration_cast<std::chrono::seconds>(
