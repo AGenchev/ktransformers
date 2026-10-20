@@ -384,6 +384,12 @@ void NumaJobDistributor::do_numa_job(std::function<void(int)> compute_func) {
 
 void NumaJobDistributor::worker_thread(int numa_id) {
   auto start = std::chrono::high_resolution_clock::now();
+  // Pin BOTH halves of the NUMA equation: memory (existing) and CPU (added).
+  // Without the CPU pin the thread floats across sockets (observed: 271/283
+  // scheduler threads with affinity 0-95), so first-touch placements and the
+  // forward()/load_weights() work it executes lose node locality even though
+  // its membind is correct.
+  set_to_numa(numa_id);
   set_memory_to_numa(numa_id);
   status[numa_id] =
       std::move(std::unique_ptr<std::atomic<ThreadStatus>>(new std::atomic<ThreadStatus>(ThreadStatus::WAITING)));

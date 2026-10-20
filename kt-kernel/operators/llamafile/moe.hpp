@@ -8,7 +8,8 @@
 #include <fcntl.h>     // open (BF16 expert pool mmap), memfd_create, posix_fadvise
 #include <sys/mman.h>  // madvise / MADV_WILLNEED (warm the aliased GGUF mmap into page cache)
 #include <sys/stat.h>  // fstat (BF16 expert pool size check)
-#include <unistd.h>    // sysconf(_SC_PAGESIZE)
+#include <unistd.h>   // sysconf(_SC_PAGESIZE)
+#include <cerrno>     // errno (prefetch pin/probe diagnostics)
 
 #include <algorithm>
 #include <atomic>
@@ -399,9 +400,75 @@ struct KtBf16PoolState {
         auto* base = (volatile uint8_t*)m;
         const size_t bytes = (size_t)total;
         const bool already_resident = (memfd >= 0);  // copy phase populated it
-        std::thread([base, bytes, already_resident] {
+        const int pf_fd = fd;  // lambda capture: fd is a member, copy by value
+        std::thread([base, bytes, already_resident, pf_fd] {
           const auto t0 = std::chrono::steady_clock::now();
+          // KT_POOL_NUMA_NODES="4-7": pin the prefetch thread's CPU to the
+          // GPU-attached socket. Page cache for faulted pool pages lands on
+          // the reader's node, so full-GPU prep (which streams the pool into
+          // that socket's PCIe root) reads node-local; once those nodes fill,
+          // the kernel overflows to the other socket — the intended two-tier
+          // placement (GPU-socket first, spill to second CPU). Decode-side
+          // GGUF pages are a separate file and unaffected.
+          if (const char* nn = std::getenv("KT_POOL_NUMA_NODES")) {
+            if (struct bitmask* nodebm = numa_parse_nodestring(nn)) {
+              // numa_sched_setaffinity wants a CPU mask, not a node mask:
+              // convert each requested NUMA node to its CPU set and OR them.
+              struct bitmask* cpubm = numa_allocate_cpumask();
+              bool anycpu = false;
+              for (int n = 0; n < numa_num_configured_nodes(); n++) {
+                if (numa_bitmask_isbitset(nodebm, n)) {
+                  struct bitmask* nb = numa_allocate_cpumask();
+                  if (numa_node_to_cpus(n, nb) == 0) {
+                    for (unsigned c = 0; c < numa_num_configured_cpus(); c++) {
+                      if (numa_bitmask_isbitset(nb, c)) numa_bitmask_setbit(cpubm, c);
+                    }
+                    anycpu = true;
+                  }
+                  numa_bitmask_free(nb);
+                }
+              }
+              if (anycpu && numa_sched_setaffinity(0, cpubm) != 0) {
+                fprintf(stderr, "[KtBf16Pool] prefetch CPU pin to nodes %s failed (errno=%d)\n", nn, errno);
+              } else if (anycpu) {
+                fprintf(stderr, "[KtBf16Pool] prefetch thread pinned to NUMA nodes %s (GPU-socket CPUs)\n", nn);
+              }
+              numa_bitmask_free(cpubm);
+              numa_bitmask_free(nodebm);
+            }
+          }
+          // Partial-cache probe: after host memory pressure evicts chunks of
+          // the pool, a leftover MIXED cache destroys kernel readahead (observed
+          // 0.2-0.4 GB/s single-thread touch on a 2.7 GB/s device). Probe
+          // residency first: near-full -> skip the re-read; mixed -> drop the
+          // stale pages for one clean sequential stream; cold -> just stream.
+          double cached_frac = 0.0;
+          bool skip_touch = false;
           if (!already_resident) {
+            size_t res = 0, tot = 0;
+            const size_t span = 512ull << 30;  // one probe per 512 GiB
+            const size_t plen = 16ull << 20;   // probe window per span
+            std::vector<unsigned char> vec(plen / 4096);
+            for (size_t off = 0; off + plen <= bytes; off += span) {
+              if (::mincore((void*)(base + off), plen, vec.data()) != 0) continue;
+              for (unsigned char v : vec) res += (v & 1u);
+              tot += vec.size();
+            }
+            if (tot > 0) cached_frac = (double)res / (double)tot;
+          }
+          if (!already_resident && cached_frac > 0.90) {
+            fprintf(stderr, "[KtBf16Pool] prefetch: pool ~%.0f%% still resident — skipping re-read\n",
+                    cached_frac * 100.0);
+            skip_touch = true;
+          } else if (!already_resident && cached_frac > 0.05) {
+            fprintf(stderr,
+                    "[KtBf16Pool] prefetch: pool %.0f%% partially cached after memory pressure — "
+                    "dropping stale pages for one clean sequential stream\n",
+                    cached_frac * 100.0);
+            ::posix_fadvise(pf_fd, 0, 0, POSIX_FADV_DONTNEED);
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+          }
+          if (!already_resident && !skip_touch) {
           // Touch one byte per page: a page-fault read pulls the full page in.
           const size_t page = 4096;
           size_t touched = 0;
@@ -418,7 +485,7 @@ struct KtBf16PoolState {
               fflush(stderr);
             }
           }
-          }  // !already_resident
+          }  // !already_resident && !skip_touch
           // Keep the pool resident: without locking, the kernel trades pool
           // pages against other containers' cache and warm passes degrade
           // toward disk speed (observed ~2.6 s/layer with swap churn). In
@@ -643,6 +710,10 @@ class LLAMA_MOE_TP {
   // owning a memcpy'd copy (see load_weights identity short-circuit). When true, the ctor's
   // lazy new[] reservations were freed and these must NOT be delete[]'d (they point into mmap).
   bool m_weights_aliased_ = false;
+  // Ownership of the three m_local_*_proj_ allocations (numa_alloc_onnode vs
+  // plain new[]), plus their byte sizes for the matching numa_free()/delete[].
+  bool m_weights_on_node_ = false;
+  size_t m_weight_bytes_[3] = {0, 0, 0};
 
   float* s_input_fp32_;    // [hidden_size]
   uint8_t* s_gate_input_;  // [hidden_size * ggml_type_size(ggml_internal_get_type_traits(gate_type).vec_dot_type) /
@@ -784,13 +855,43 @@ class LLAMA_MOE_TP {
     m_local_down_output_ptr_.resize(config_.expert_num);
 
     auto size = 1ll * config.expert_num * config.intermediate_size * config.hidden_size;
-    m_local_up_proj_ =
-        new uint8_t[size * ggml_type_size((ggml_type)config.up_type) / ggml_blck_size((ggml_type)config.up_type)];
-
-    m_local_gate_proj_ =
-        new uint8_t[size * ggml_type_size((ggml_type)config.gate_type) / ggml_blck_size((ggml_type)config.gate_type)];
-    m_local_down_proj_ =
-        new uint8_t[size * ggml_type_size((ggml_type)config.down_type) / ggml_blck_size((ggml_type)config.down_type)];
+    // Allocate the resident quantized weight slices on THIS TP's NUMA node
+    // (numa_alloc_onnode), instead of plain `new` which first-touched them
+    // wherever the allocating thread ran, scattering decode reads across both
+    // sockets (observed ~50% of the per-socket DRAM ceiling).
+    // Ownership: node memory, freed with numa_free(). All free sites
+    // (alias path in load_weights, ~LLAMA_MOE_TP) must check this flag —
+    // delete[] on numa_alloc memory is UB. The alias path (tp_count==1)
+    // frees them because the pointers get replaced by the GGUF mmap.
+    // Note: SharedMemBufferNuma is NOT usable here — its arena reuses
+    // pointers at equal size and reallocs without copy, i.e. it is for
+    // per-layer scratch, not persistent 60+ GB weights.
+    const size_t up_bytes =
+        size * ggml_type_size((ggml_type)config.up_type) / ggml_blck_size((ggml_type)config.up_type);
+    const size_t gate_bytes =
+        size * ggml_type_size((ggml_type)config.gate_type) / ggml_blck_size((ggml_type)config.gate_type);
+    const size_t down_bytes =
+        size * ggml_type_size((ggml_type)config.down_type) / ggml_blck_size((ggml_type)config.down_type);
+    m_local_up_proj_ = (uint8_t*)numa_alloc_onnode(up_bytes, tp_part_idx);
+    m_local_gate_proj_ = (uint8_t*)numa_alloc_onnode(gate_bytes, tp_part_idx);
+    m_local_down_proj_ = (uint8_t*)numa_alloc_onnode(down_bytes, tp_part_idx);
+    if (!m_local_up_proj_ || !m_local_gate_proj_ || !m_local_down_proj_) {
+      // Fall back to default locality rather than dying — correctness first.
+      fprintf(stderr, "[LLAMA_MOE_TP] numa_alloc_onnode(node %d) failed; falling back to plain alloc\n",
+              tp_part_idx);
+      if (m_local_up_proj_) numa_free(m_local_up_proj_, up_bytes);
+      if (m_local_gate_proj_) numa_free(m_local_gate_proj_, gate_bytes);
+      if (m_local_down_proj_) numa_free(m_local_down_proj_, down_bytes);
+      m_local_up_proj_ = new uint8_t[up_bytes];
+      m_local_gate_proj_ = new uint8_t[gate_bytes];
+      m_local_down_proj_ = new uint8_t[down_bytes];
+      m_weights_on_node_ = false;
+    } else {
+      m_weights_on_node_ = true;
+    }
+    m_weight_bytes_[0] = up_bytes;
+    m_weight_bytes_[1] = gate_bytes;
+    m_weight_bytes_[2] = down_bytes;
   }
 
   ~LLAMA_MOE_TP() { shared_mem_buffer_numa.dealloc(tp_part_idx, this); }
@@ -835,9 +936,17 @@ class LLAMA_MOE_TP {
     //     one page cache) => streaming-prefill stops re-reading cold GGUF from disk.
     // Multi-NUMA (tp_count>1) has strided per-node slices and cannot alias -> falls through to copy.
     if (offset == 0 && complete_intermediate_size == config.intermediate_size) {
-      delete[] m_local_gate_proj_;
-      delete[] m_local_up_proj_;
-      delete[] m_local_down_proj_;
+      // Free the previous allocation respecting its ownership: numa_alloc_onnode
+      // memory must be numa_free()'d (delete[] is UB), plain new[] needs delete[].
+      if (m_weights_on_node_) {
+        numa_free(m_local_up_proj_, m_weight_bytes_[0]);
+        numa_free(m_local_gate_proj_, m_weight_bytes_[1]);
+        numa_free(m_local_down_proj_, m_weight_bytes_[2]);
+      } else {
+        delete[] m_local_gate_proj_;
+        delete[] m_local_up_proj_;
+        delete[] m_local_down_proj_;
+      }
       m_local_gate_proj_ = gate_proj;  // == (uint8_t*)config.gate_proj (offset==0)
       m_local_up_proj_ = up_proj;
       m_local_down_proj_ = down_proj;
