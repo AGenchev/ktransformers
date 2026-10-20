@@ -292,68 +292,99 @@ struct KtBf16PoolState {
         }
       }
       if (memfd >= 0) {
-        // Stream file -> memfd in 4 GiB chunks; drop the source page cache
-        // in batches so peak usage stays ~1 copy + 1 batch. A time-based
-        // progress line every ~15 s (with MB/s) keeps liveness observable
-        // even when a 4 GiB chunk takes tens of seconds.
+        // Stream file -> memfd in PARALLEL, one writer thread per node of
+        // KT_POOL_NUMA_NODES (default: all nodes). Writers are CPU-pinned:
+        // shmem pages are allocated under the writing task's NUMA policy, so
+        // a pinned writer lands its blocks node-local. The previous single
+        // unpinned writer collapsed all 1.37 TB onto its own node (filled at
+        // ~280 GiB, copy throttled to ~0.1 GB/s). Blocks are handed out
+        // round-robin so the pool interleaves across the GPU-socket nodes;
+        // when those fill, the kernel spills to the second socket (the
+        // intended two-tier placement). Each writer keeps a 1 GiB bounce
+        // buffer and drops the source page cache per block, so peak cache
+        // usage stays ~writers x 1 GiB above the mapping itself.
         const auto t_copy = std::chrono::steady_clock::now();
-        constexpr size_t CHUNK = 4ull << 30;
-        constexpr int DONTNEED_BATCH = 4;  // drop cache every 4 chunks
-        std::vector<char> heap_buf;
-        bool copy_ok = true;
-        int chunks_done = 0;
-        off_t batch_start = 0;
-        size_t batch_bytes = 0;
-        size_t last_logged_off = 0;
-        auto last_log_t = t_copy;
-        for (size_t off = 0; off < (size_t)total && copy_ok; off += CHUNK) {
-          const size_t n = std::min(CHUNK, (size_t)total - off);
-          char* buf = kt_pool_io_buf(heap_buf, n);
-          size_t done = 0;
-          while (done < n) {
-            const ssize_t r = ::pread(fd, buf + done, n - done, (off_t)(off + done));
-            if (r <= 0) {
-              copy_ok = false;
-              break;
+        std::atomic<bool> copy_ok{true};
+        std::atomic<uint64_t> copied{0};
+        std::atomic<bool> copy_done{false};
+
+        std::vector<int> copy_nodes;
+        {
+          const char* nn = std::getenv("KT_POOL_NUMA_NODES");
+          struct bitmask* bm = nn ? numa_parse_nodestring(nn) : nullptr;
+          if (bm) {
+            for (int n = 0; n < numa_num_configured_nodes(); n++)
+              if (numa_bitmask_isbitset(bm, n)) copy_nodes.push_back(n);
+            numa_bitmask_free(bm);
+          }
+          if (copy_nodes.empty())
+            for (int n = 0; n < numa_num_configured_nodes(); n++) copy_nodes.push_back(n);
+        }
+        int nwriters = (int)copy_nodes.size();
+        if (const char* ct = std::getenv("KT_POOL_COPY_THREADS")) {
+          nwriters = std::min(nwriters, std::max(1, atoi(ct)));
+        }
+        nwriters = std::max(1, std::min(nwriters, 16));
+        constexpr size_t COPY_BLOCK = 16ull << 30;  // round-robin work unit
+        constexpr size_t COPY_CHUNK = 1ull << 30;   // per pread/pwrite bounce
+        const size_t nblocks = (total + COPY_BLOCK - 1) / COPY_BLOCK;
+        std::vector<std::thread> cthreads;
+        for (int t = 0; t < nwriters; t++) {
+          cthreads.emplace_back([&, t] {
+            const int node = copy_nodes[t % (int)copy_nodes.size()];
+            struct bitmask* nb = numa_allocate_cpumask();
+            if (nb) {
+              if (numa_node_to_cpus(node, nb) == 0) numa_sched_setaffinity(0, nb);
+              numa_bitmask_free(nb);
             }
-            size_t w = 0;
-            while (w < (size_t)r) {
-              const ssize_t s = ::pwrite(memfd, buf + done + w, (size_t)r - w,
-                                         (off_t)(off + done + w));
-              if (s <= 0) {
-                copy_ok = false;
-                break;
+            std::vector<char> buf;
+            for (size_t b = t; b < nblocks; b += nwriters) {
+              if (!copy_ok.load(std::memory_order_relaxed)) return;
+              const size_t begin = b * COPY_BLOCK;
+              const size_t end = std::min(begin + COPY_BLOCK, (size_t)total);
+              for (size_t off = begin; off < end; off += COPY_CHUNK) {
+                if (!copy_ok.load(std::memory_order_relaxed)) return;
+                const size_t n = std::min(COPY_CHUNK, (size_t)(end - off));
+                if (buf.size() < n) buf.resize(n);
+                size_t done = 0;
+                while (done < n) {
+                  const ssize_t r = ::pread(fd, buf.data() + done, n - done, (off_t)(off + done));
+                  if (r <= 0) { copy_ok.store(false); return; }
+                  size_t w = 0;
+                  while (w < (size_t)r) {
+                    const ssize_t s = ::pwrite(memfd, buf.data() + done + w, (size_t)r - w,
+                                               (off_t)(off + done + w));
+                    if (s <= 0) { copy_ok.store(false); return; }
+                    w += (size_t)s;
+                  }
+                  done += (size_t)r;
+                }
+                ::posix_fadvise(fd, (off_t)off, (off_t)n, POSIX_FADV_DONTNEED);
+                copied.fetch_add(n, std::memory_order_relaxed);
               }
-              w += (size_t)s;
             }
-            if (!copy_ok) break;
-            done += (size_t)r;
-            const auto now = std::chrono::steady_clock::now();
-            const double since = std::chrono::duration<double>(now - last_log_t).count();
-            if (since >= 15.0) {
-              const auto el =
-                  std::chrono::duration_cast<std::chrono::seconds>(now - t_copy).count();
-              const double mbps = (double)((off + done) - last_logged_off) / since / (1024.0 * 1024.0);
-              fprintf(stderr, "[KtBf16Pool] memfd copy %zu/%zu GiB (%lld s, %.0f MB/s)\n",
-                      (off + done) >> 30, (size_t)total >> 30, (long long)el, mbps);
-              fflush(stderr);
-              last_logged_off = off + done;
-              last_log_t = now;
-            }
-          }
-          if (!copy_ok) break;
-          chunks_done++;
-          batch_bytes += n;
-          if (chunks_done % DONTNEED_BATCH == 0) {
-            ::posix_fadvise(fd, batch_start, (off_t)batch_bytes, POSIX_FADV_DONTNEED);
-            batch_start = (off_t)(off + n);
-            batch_bytes = 0;
-          }
+          });
         }
-        if (batch_bytes > 0 && copy_ok) {
-          ::posix_fadvise(fd, batch_start, (off_t)batch_bytes, POSIX_FADV_DONTNEED);
-        }
-        if (!copy_ok) {
+        std::thread copy_logger([&] {
+          size_t prev = 0;
+          auto prev_t = t_copy;
+          while (!copy_done.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::seconds(15));
+            const size_t now_b = copied.load();
+            const auto now_t = std::chrono::steady_clock::now();
+            const double mbps = (double)(now_b - prev) / 1048576.0 /
+                                std::chrono::duration<double>(now_t - prev_t).count();
+            fprintf(stderr, "[KtBf16Pool] memfd copy %zu/%zu GiB (%.0f MB/s, %d writers)\n",
+                    now_b >> 30, (size_t)total >> 30, mbps, nwriters);
+            fflush(stderr);
+            prev = now_b;
+            prev_t = now_t;
+          }
+        });
+        for (auto& th : cthreads) th.join();
+        copy_done.store(true);
+        copy_logger.join();
+        if (!copy_ok.load()) {
           fprintf(stderr, "[KtBf16Pool] memfd copy failed; using file mapping\n");
           fflush(stderr);
           ::close(memfd);
