@@ -16,9 +16,17 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_JIT_DEEPGEMM=0 # can't fuse CPU+GPU at the same time
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 # downgrade TP mem imbalance to warning
 export KT_BF16_EXPERT_POOL=/work/models/GLM-5.3-bf16-expert-pool
-export KT_POOL_DIRECT_DMA=1
 export KT_POOL_PREFETCH=1
-export KT_POOL_MEMFD=1 # shmem replica of the pool -> cudaHostRegister works -> direct DMA active
+# FILE MODE (deliberate, 2026-10-21). memfd+direct-DMA is DISABLED on this host
+# until the RAM budget grows: the 1368 GiB shmem replica + GGUF anon copies +
+# container overhead exceed physical RAM, shmem pages swap into zram, and page
+# faults on zram-backed shmem deadlock the scheduler in D-state (observed:
+# load 324, container unkillable). kt-kernel now self-guards (MemAvailable <
+# pool + 300 GiB => automatic file-mode fallback). To try memfd again:
+#   export KT_POOL_MEMFD=1 KT_POOL_DIRECT_DMA=1 KT_POOL_NUMA_NODES=0-7
+# (parallel copy: 8 writers ~2.4 GB/s vs 0.1 GB/s single-writer collapse)
+# unset: KT_POOL_DIRECT_DMA (needs a registerable mapping; file mapping is not)
+# unset: KT_POOL_MEMFD (see above)
 
 python -m sglang.launch_server \
   --model /work/weights/GLM-5.3-BF16 \
