@@ -277,6 +277,32 @@ struct KtBf16PoolState {
       const char* memfd_env = std::getenv("KT_POOL_MEMFD");
       const bool want_memfd = memfd_env && memfd_env[0] == '1';
       if (want_memfd) {
+        // SAFETY GUARD: the shmem replica must fit in RAM with margin, or the
+        // kernel swaps shmem pages into zram/swap under pressure. Page faults
+        // on zram-backed shmem then stall in D-state indefinitely — observed
+        // on this host: load 324, scheduler deadlocked in
+        // lock_mm_and_find_vma mid-copy, container unkillable (2026-10-20).
+        // Require MemAvailable >= pool + 300 GiB margin, else fall back to
+        // the file mapping (page cache reclaim is always recoverable).
+        long mem_available_kb = 0;
+        if (FILE* mi = ::fopen("/proc/meminfo", "r")) {
+          char key[64]; long val;
+          while (::fscanf(mi, "%63s %ld kB\n", key, &val) == 2) {
+            if (::strcmp(key, "MemAvailable:") == 0) { mem_available_kb = val; break; }
+          }
+          ::fclose(mi);
+        }
+        const long need_kb = (long)((total >> 10) + (300ull << 20));
+        if (mem_available_kb > 0 && mem_available_kb < need_kb) {
+          fprintf(stderr,
+                  "[KtBf16Pool] memfd guard: MemAvailable %.0f GiB < pool %.0f GiB + 300 GiB margin; "
+                  "falling back to file mapping (zram-backed shmem faults can deadlock)\n",
+                  mem_available_kb / 1048576.0, (double)total / (1024ull << 20));
+          fflush(stderr);
+          want_memfd = false;
+        }
+      }
+      if (want_memfd) {
         memfd = ::memfd_create("kt_bf16_expert_pool", 0);
         if (memfd < 0) {
           fprintf(stderr, "[KtBf16Pool] memfd_create failed (errno=%d); using file mapping\n", errno);
