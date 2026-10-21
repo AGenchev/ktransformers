@@ -36,3 +36,5 @@ CMakeFiles/
 kvc2/
 sched/
 *.png
+# server logs (never commit)
+server-pool-*.log
